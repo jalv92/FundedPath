@@ -1419,13 +1419,13 @@ namespace FundedPath.NT
         {
             if (!f.Tracked) { _chart.SetUntracked(); return; }
 
-            // The Session view carries NO target line. The challenge target sits thousands of dollars
-            // from an intraday range of a few hundred, and forcing it into the y-range squeezed a $200
-            // replayed day into 3.5% of the plot - the view he stares at all evening, least readable of
-            // the two. The rail's TO TARGET card carries that number all the same. The FLOOR stays: it
-            // is the line today is actually traded against. (Departs from the approved mockup, which
-            // draws the green line in both views - noted in the hand-off.)
-            double target = f.SessionView ? 0.0 : GoalBalance(f.Rules);
+            // BOTH views draw the target. The Session view briefly did not: a challenge target thousands
+            // of dollars from an intraday range of a few hundred has to be forced into the y-range, and
+            // that squeezed a quiet replayed day into a few percent of the plot. The trader overruled it
+            // on 2026-08-22 - he wants the dashed green line where the target is, in every view, the way
+            // his funding dashboard draws it, and a compressed quiet day is the price he is paying
+            // knowingly. Do not "fix" this back without asking him.
+            double target = GoalBalance(f.Rules);
             // The buffer line is a funded-phase idea only: it is the not-withdrawable floor of the payout
             // maths, and drawing it on an evaluation would invent a level that rule set does not have.
             double buffer = f.Rules.Phase == Phase.LiveSim ? f.Rules.Buffer : 0.0;
