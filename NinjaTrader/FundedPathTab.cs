@@ -1345,14 +1345,23 @@ namespace FundedPath.NT
             // because a day count says nothing about the session you are inside.
             if (f.SessionView)
             {
-                int win = 0, loss = 0;
+                // The headline counts the same things the subline partitions. It used to headline
+                // FillsToday - raw executions - over a win/loss split of CLOSED TRADES, so a real
+                // session read "35" above "24 winners - 3 losers": two different denominators stacked
+                // as if they added up. A scale-in is several fills and one trade, so they never will.
+                int win = 0, loss = 0, flat = 0;
                 for (int i = 0; i < f.Session.Count; i++)
                 {
-                    if (f.Session[i].ProfitCurrency > 0) win++;
-                    else if (f.Session[i].ProfitCurrency < 0) loss++;
+                    double pl = f.Session[i].ProfitCurrency;
+                    if (pl > 0) win++;
+                    else if (pl < 0) loss++;
+                    else flat++;
                 }
-                SetCard(_cards[4], "FILLS TODAY", f.FillsToday.ToString(CultureInfo.InvariantCulture),
-                    win + " winners" + Dot + loss + " losers", TextCol);
+                string split = win + " up" + Dot + loss + " down";
+                if (flat > 0) split += Dot + flat + " flat";
+                if (f.FillsToday > 0) split += Dot + f.FillsToday.ToString(CultureInfo.InvariantCulture) + " fills";
+                SetCard(_cards[4], "TRADES TODAY",
+                    f.Session.Count.ToString(CultureInfo.InvariantCulture), split, TextCol);
             }
             else
             {

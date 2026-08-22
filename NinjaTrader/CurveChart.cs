@@ -396,10 +396,18 @@ namespace FundedPath.NT
             }
             int stride = 1;
             if (_stepX > 0 && widest > 0) stride = Math.Max(1, (int)Math.Ceiling((widest + 16) / _stepX));
+            // Consecutive duplicates are skipped, not drawn. Stride only guarantees the labels do not
+            // TOUCH; it says nothing about them being different. A replay session puts several fills
+            // inside the same minute, so a session axis came out reading "12:41 12:41 12:41 12:41" -
+            // four identical stamps that look like a rendering fault and tell the trader nothing. A gap
+            // where the stamp would repeat is the honest answer: nothing new to say at this tick.
+            string placed = null;
             for (int i = n - 1; i >= 0; i -= stride)
             {
                 string s = _pts[i].Label;
                 if (string.IsNullOrEmpty(s)) continue;
+                if (s == placed) continue;
+                placed = s;
                 FormattedText ft = FT(s, AxisSize, i == n - 1 ? TextBr : MutedBr, dpi, Mono);
                 double x = _px[i] - ft.Width / 2.0;
                 if (x < 0) x = 0;
