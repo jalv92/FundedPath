@@ -9,6 +9,7 @@
 
 <p align="center">
   <a href="#the-floor-is-the-part-people-get-wrong">The floor</a> ·
+  <a href="#one-run-or-one-per-day">Run modes</a> ·
   <a href="#status">Status</a> ·
   <a href="#install">Install</a> ·
   <a href="#the-rulebook-it-models">Rulebook</a> ·
@@ -19,7 +20,7 @@
   <img src="https://img.shields.io/badge/status-phase%201%20built-F2B33D?style=flat-square" alt="status: phase 1 built">
   <img src="https://img.shields.io/badge/platform-NinjaTrader%208-4A7DFF?style=flat-square" alt="platform: NinjaTrader 8">
   <img src="https://img.shields.io/badge/C%23-7.3-27D67B?style=flat-square" alt="C# 7.3">
-  <img src="https://img.shields.io/badge/tests-69%20passing-27D67B?style=flat-square" alt="unit tests">
+  <img src="https://img.shields.io/badge/tests-84%20passing-27D67B?style=flat-square" alt="unit tests">
   <img src="https://img.shields.io/badge/account-read--only%20until%20armed-FF5468?style=flat-square" alt="read-only on the account until you arm enforcement">
   <img src="https://img.shields.io/badge/license-MIT-7A87A2?style=flat-square" alt="MIT license">
 </p>
@@ -60,6 +61,12 @@ floor(day i) = min( max(SeededHwm, closes before day i) - MaxLoss , StartBalance
 mid-challenge — see [First run](#first-run). Bind on day one and it is just the start balance, and
 the expression is the plain one.
 
+That is the floor of **one running challenge**, which is the default and the way a real evaluation is
+actually traded. A binding can instead treat every day as its own challenge — for judging an
+automated strategy one Market Replay day at a time — and then there are no earlier closes to trail
+from, so the whole expression collapses to a flat `start − max loss` that never moves.
+[Both modes, and when to pick which.](#one-run-or-one-per-day)
+
 That one expression is the whole product. Everything else on the window exists to put it in context:
 how much room you have to it right now, how much is left to the target, and which of the two you hit
 first. It is computed from **end-of-day closes only** — never from an intraday high — because that is
@@ -85,7 +92,7 @@ on the *other* payout gate, the day count.
 
 | Layer | State |
 |-------|-------|
-| **Engine** (`Engine/`) | Complete. Pure C# 7.3, deterministic, zero NinjaTrader references. **69 unit tests passing.** |
+| **Engine** (`Engine/`) | Complete. Pure C# 7.3, deterministic, zero NinjaTrader references. **84 unit tests passing.** |
 | **NT8 add-on** (`NinjaTrader/`) | **Built and running.** Compiles clean through the full-tree gate (`tools/verify-compile.sh`) and passed its first Market Replay rehearsal on 2026-08-22 — that session is the hero image above. Not yet run against a real funded challenge. |
 | **Firms modelled** | **One: Lucid Trading, LucidPro** — all four sizes, all three phases. MyFundedFutures, Apex and Topstep appear in the dropdown greyed out and labelled "not modelled yet". They are placeholders, not rulebooks. |
 | **Rule fidelity** | The evaluation phase carries **no open disagreement**: every value is verified against Lucid's own help centre, except the 25K daily loss limit, which is settled from the trader's own dashboard. **Four are still open** — three in the funded and live phases, one cross-phase (whether unrealized P&L counts against the floor). All four ship as specified and all are surfaced in the window's warning block, which prints the first six warnings and carries the whole list, in order, on hover; three more were closed on 2026-08-22. See [`docs/rules-sources.md`](docs/rules-sources.md). |
@@ -120,6 +127,69 @@ contamination is what corrupted an earlier tool's ledger; it is designed out her
 
 ---
 
+## One run, or one per day
+
+A prop evaluation is **one run that spans days**: yesterday's profit is in today's balance, and every
+green close drags the floor up behind you. That is what this window measures by default, and it is
+what your firm's dashboard shows you.
+
+There is a second question with the same rulebook, and it is the one you ask in Market Replay:
+**did *this day* pass?** Run a day, read the verdict, jump to the next day. A running challenge
+answers it wrongly twice over — yesterday's +$700 is sitting in today's balance, and yesterday's
+close has already moved today's floor, so day 3 passes partly because day 2 was green.
+
+So each binding chooses **how days count**, in the binding dialog, and everything else follows:
+
+| | **One running challenge** *(default)* | **Each day is its own challenge** |
+|---|---|---|
+| Balance | start balance + every completed day + today | start balance + today, and nothing else |
+| Floor | `max(closes so far) − max loss` — ratchets on every green close, freezes at `start + 100` | `start − max loss`. Flat all day, the same every day, never ratchets |
+| Peak day close | seeds the high-water mark | ignored — it is a claim about a run, and there is no run |
+| Profit target | the plan's target, reached over the run | the plan's **full** target, in one day. LucidPro allows a one-day pass, so the question is fair as posed |
+| A breach | latches until you reset it | latches for that day; the next trading day starts clean |
+| Enforcement | as armed | as armed — the day broke, so the strategy stops |
+| The day ledger | the run's history: summed into the balance, feeds the floor | a **scorecard**: one row per day, that day's P&L and that day's own verdict, never summed |
+| The Challenge chart | one compounding curve | one point per day at `start + that day's own P&L`, under a flat floor line |
+| Fifth rail card | `TRADING DAYS` | `DAYS PASSED` — *3 of 10*, each day judged on its own |
+
+**Neither choice deletes anything.** Both modes write the same ledger file, day by day, and each day
+keeps its own row on disk — its P&L, its fills, and whatever the panel recorded about a rule break. The mode changes what counts, not what is kept — switch back and the
+run reads exactly as it did. And every binding is a running challenge unless you say otherwise: a
+`bindings.xml` written before this option existed carries no run mode and loads as one, so nothing
+starts counting differently because you updated the add-on.
+
+### Judging an automated strategy in Market Replay
+
+1. **Bind the Playback account** to the plan you are testing — same firm, plan, size and phase you
+   would actually buy. A replay account keeps its own ledger and can never move a real challenge's
+   high-water mark, so this is safe to do against the plan you are really trading.
+2. **Set "How days count" to "Each day is its own challenge."** Leave the peak day close empty —
+   it is not used in this mode.
+3. **Decide whether to arm enforcement.** Armed, a strategy that breaks a rule gets flattened and
+   stopped mid-day, which is what the firm would do to it — the day ends where it would really have
+   ended. On "Warn me only" the day runs to the close and you read the damage afterwards.
+4. **Run the replay day.** The verdict answers *this* day: `PASSED` at the plan's full target,
+   `BREACHED` at the flat floor, `DAY LOCKED` at the daily limit if you bought one, `IN PROGRESS`
+   until one of them happens.
+5. **Jump to the next replay day.** It opens at the plan's start balance, with a fresh floor and a
+   clean latch. Yesterday's result is on the scorecard, not in today's arithmetic.
+6. **Read the scorecard.** The Challenge view is a row of independent outcomes, one point per day,
+   and the fifth rail card reads `DAYS PASSED — 3 of 10`. Ten replay days, ten verdicts, in one
+   session.
+
+**Starting over, in either mode.** **NEW RUN**, in the toolbar, makes today the run's first day:
+every day already recorded stops counting toward the run, a latched breach is cleared, and the record
+of what the panel did about a rule break is dropped. Your history stays in the ledger file — it
+simply stops counting. The latched-breach banner offers the same action as **START A NEW RUN**,
+because starting again is what you actually want after a breach.
+
+It asks before it does any of it, and the question says the part that matters out loud: **it changes
+only what this panel remembers.** If your firm logged a breach, the account is still breached with
+them and nothing in this repository can give it back — and if the account is still under its floor,
+the panel latches again on the very next tick.
+
+---
+
 ## What it reads, and what it never does
 
 **Reads, per bound account:**
@@ -140,10 +210,12 @@ version as `.bak`.
 - `bindings.xml` — your account bindings. One file, every account.
 - `days-<provider>_<account>.xml` — **one per bound account**: the ledger of completed trading days.
   It is not a cache. `Account.Executions` holds the current session only, roughly three days, so
-  after an NT8 restart a 20-day evaluation cannot be rebuilt from the platform at all. A green day
-  that goes missing lowers the high-water mark, which lowers the floor, which reports *more* room
-  than you have — the dangerous direction. Only the day in progress comes from executions;
-  everything before it comes from this file. Deleting it is not a harmless reset.
+  after an NT8 restart a 20-day evaluation cannot be rebuilt from the platform at all. In a running
+  challenge a green day that goes missing lowers the high-water mark, which lowers the floor, which
+  reports *more* room than you have — the dangerous direction. Only the day in progress comes from
+  executions; everything before it comes from this file. Deleting it is not a harmless reset.
+  Both run modes write it; a per-day binding reads it as a scorecard of finished days rather than as
+  the history of a run, so there a missing day is a hole in your record, not a wrong floor.
 
 **Never, under any circumstance:** places, modifies or cancels an order. There is no order-entry
 surface anywhere in this repository.
@@ -246,22 +318,27 @@ Requires NinjaTrader 8. No NuGet packages, no DLLs, no external dependencies —
    phase. Nothing is measured until you do, and nothing but the accounts you bind is ever touched.
 2. **Pick the challenge.** Size and phase set the whole rulebook — target, max loss, floor lock,
    buffer. Set the daily-loss-limit toggle to match what you actually bought at checkout.
-3. **If the challenge did not start today, type in your highest end-of-day close.** The day series
-   is rebuilt from `Account.Executions`, and NinjaTrader keeps only the current session there —
+3. **Choose how days count.** Leave it on *One running challenge* for a real evaluation: that is a
+   run spanning days, scored the way the firm scores it. Switch it to *Each day is its own
+   challenge* when you are judging a strategy one Market Replay day at a time and the only thing you
+   want to know is whether each day passed. [The two modes, side by side.](#one-run-or-one-per-day)
+4. **In a running challenge that did not start today, type in your highest end-of-day close.**
+   The day series is rebuilt from `Account.Executions`, and NinjaTrader keeps only the current session there —
    roughly three days. Bind a 50K evaluation on day 12 and the platform can tell the cockpit nothing
    about days 1 to 9: the high-water mark would restart from $50,000 and the floor would read
    **$2,000 lower than the real one**, which is the direction that gets accounts closed. So the
    binding dialog asks for the peak close you have already made, previews the floor it produces while
    you type, and stores it with the binding: the engine starts its high-water mark there. Leave it
-   empty only when day one is today.
+   empty when day one is today — and in per-day mode, where there is no run for a peak close to be a
+   claim about and the box is ignored.
 
-4. **If this account traded something else before the challenge, set the first day counted.**
+5. **If this account traded something else before the challenge, set the first day counted.**
    Ledger days that closed before that date are left out — an earlier evaluation, a reset, a
-   rehearsal — so their closes cannot ratchet a high-water mark for a challenge that had not begun.
-   They are filtered, not deleted: a wrong date here loses no history. Leave it empty to count
-   every day in the ledger.
+   rehearsal — so their closes cannot ratchet a high-water mark for a challenge that had not begun,
+   and so they stay off a per-day scorecard. They are filtered, not deleted: a wrong date here loses
+   no history. Leave it empty to count every day in the ledger.
 
-5. **Done.** From here the window computes everything from your own fills, and each completed day is
+6. **Done.** From here the window computes everything from your own fills, and each completed day is
    written to the ledger so the next restart still knows about it.
 
 ## Development
@@ -304,9 +381,9 @@ Read these before you rely on a number.
   trade producing at least $1 of net P&L in 30 calendar days. No floor logic catches that.
 - **Payout maximums per cycle, and live contract caps by profit tier and exchange, are not modelled.**
 - **NinjaTrader only remembers about three days of executions.** Everything older is whatever the
-  day ledger recorded while the window was open — it cannot recover a day it never saw. Binding an
-  account mid-challenge without seeding the peak close leaves the floor too low, and too low reads
-  as *more* room than you have.
+  day ledger recorded while the window was open — it cannot recover a day it never saw. In a running
+  challenge, binding an account mid-challenge without seeding the peak close leaves the floor too
+  low, and too low reads as *more* room than you have.
 - **The day series comes from NinjaTrader's execution history and that ledger, and from nothing
   else.** A reset, a payout or a manual adjustment made in the firm's dashboard is invisible to the
   platform and therefore invisible here.
@@ -315,7 +392,15 @@ Read these before you rely on a number.
   your account. This tool exists so that number does not surprise you — not to replace it.
 - **A seeded peak close is only as good as what you type.** The engine starts its high-water mark at
   `max(start balance, peak close)` and the binding dialog previews the resulting floor as you type,
-  but nothing can check the number against the firm. Type it wrong low and the floor reads low.
+  but nothing can check the number against the firm. Type it wrong low and the floor reads low. A
+  per-day binding drops the seed entirely — every day starts at the plan's start balance.
+- **A per-day scorecard can only score a day it watched.** A day's verdict comes from what actually
+  latched while the window was open. A day whose P&L reached the ledger but whose intraday path the
+  panel never saw is scored on its close alone, so it reads *did not pass* rather than *breached* —
+  it will never invent a rule break it did not see.
+- **Per-day mode is built for evaluation days, not for payout planning.** On a funded binding it
+  measures the 40% consistency rule inside a single day, where your best day *is* your total profit,
+  so it will report the payout blocked every time. Judge funded consistency in a running challenge.
 
 ---
 

@@ -54,8 +54,18 @@ namespace FundedPath.NT
         public bool           Tracked      { get; set; }   // false => draw the Untracked state
         public bool           SessionView  { get; set; }   // false = Challenge (x = days), true = Session (x = fills)
 
-        // Challenge view series: the completed days, oldest first, with ClosingBalance and FloorInForce
-        // filled in by the engine. The day in progress is NOT a row here - it is the live endpoint below.
+        // RunMode.PerDay: every ET trading day is its own challenge. It is carried on the frame rather
+        // than re-read from _binding while rendering, for the same reason EquityBasis is - the title,
+        // the rail, the banner and the chart must all describe ONE run, and _binding can change between
+        // them. THE SAME PICTURE MEANS OPPOSITE THINGS in the two modes: in Continuous the curve is a
+        // balance that compounds, in PerDay it is a scatter of independent outcomes around the start
+        // balance. Anything that draws Days must say which it is looking at.
+        public bool           PerDay       { get; set; }
+
+        // Challenge view series. Continuous: the completed days, oldest first, with ClosingBalance and
+        // FloorInForce filled in by the engine. PerDay: the SCORECARD - one row per day, each priced at
+        // StartBalance + that day's OWN P&L and never summed. Either way the day in progress is NOT a
+        // row here - it is the live endpoint below.
         public IReadOnlyList<TradingDay> Days { get; set; }
 
         // Session view series: today's closed trades, oldest first, with a running balance.
@@ -192,6 +202,11 @@ namespace FundedPath.NT
         readonly Border    _stripe   = new Border { Height = 3 };
         readonly ComboBox  _accounts = new ComboBox { Width = 190 };   // the placeholder Grid below carries the margin
         readonly Button    _configure = new Button();
+        // Starts a new run: it is the answer to "when does a run END?", which is the question
+        // underneath both halves of what the trader asked for. Enabled only on a bound account,
+        // and it shares ONE handler and ONE confirmation with the banner's copy of itself - two
+        // buttons that both meant "forget" would be two different promises about the same act.
+        readonly Button    _newRun    = new Button();
         readonly System.Windows.Shapes.Ellipse _phaseDot = new System.Windows.Shapes.Ellipse();
         readonly TextBlock _phaseText = new TextBlock();
         readonly TextBlock _phaseNote = new TextBlock();
@@ -209,7 +224,7 @@ namespace FundedPath.NT
         readonly TextBlock _accountHint  = new TextBlock();
         string _warnFull = "";                  // last full warning text; the tooltip is rebuilt only on a change
         readonly StackPanel _rail        = new StackPanel();
-        readonly Chip[]     _chips       = new Chip[5];
+        readonly Chip[]     _chips       = new Chip[6];
         readonly StatCard[] _cards       = new StatCard[5];
         readonly StatCard   _untrackedCard = MakeCard();
         readonly CurveChart _chart       = new CurveChart();
@@ -391,7 +406,7 @@ namespace FundedPath.NT
             acctBox.Children.Add(_accountHint);
             left.Children.Add(acctBox);
 
-            string[] chipLabels = { "FIRM", "PLAN", "CHALLENGE", "DAILY LOSS LIMIT", "DRAWDOWN" };
+            string[] chipLabels = { "FIRM", "PLAN", "CHALLENGE", "DAILY LOSS LIMIT", "DRAWDOWN", "RUN" };
             for (int i = 0; i < _chips.Length; i++)
             {
                 _chips[i] = MakeChip(chipLabels[i]);
@@ -403,6 +418,16 @@ namespace FundedPath.NT
             _configure.VerticalAlignment = VerticalAlignment.Center;
             _configure.Click += OnConfigureClick;
             left.Children.Add(_configure);
+
+            // In the bar rather than only on the banner, because it is needed in BOTH modes and most
+            // often when nothing has latched at all: a per-day run that ended green still ends, and a
+            // continuous run the trader wants to restart has no banner to hang a button on.
+            StyleFlatButton(_newRun, "NEW RUN", Muted);
+            _newRun.Margin = new Thickness(6, 0, 0, 0);
+            _newRun.VerticalAlignment = VerticalAlignment.Center;
+            _newRun.IsEnabled = false;
+            _newRun.Click += OnFreshRunClick;
+            left.Children.Add(_newRun);
 
             bar.Children.Add(left);
             DockPanel.SetDock(bar, Dock.Top);
@@ -421,10 +446,14 @@ namespace FundedPath.NT
             _bannerText.FontFamily = Sans; _bannerText.FontSize = 12; _bannerText.FontWeight = FontWeights.Bold;
             _bannerText.TextWrapping = TextWrapping.Wrap;
             _bannerText.VerticalAlignment = VerticalAlignment.Center;
-            StyleFlatButton(_bannerReset, "RESET BREACH", TextCol);
+            // The same action as the bar's NEW RUN, same handler, same confirmation, same words.
+            // "Reset the breach" was never a separate thing a trader wanted: what he wants after a
+            // breach is to start again, and saying so is more honest than a button called RESET that
+            // silently leaves the old run's days counting.
+            StyleFlatButton(_bannerReset, "START A NEW RUN", TextCol);
             _bannerReset.Margin = new Thickness(12, 0, 0, 0);
             _bannerReset.VerticalAlignment = VerticalAlignment.Center;
-            _bannerReset.Click += OnResetBreachClick;
+            _bannerReset.Click += OnFreshRunClick;
             DockPanel bannerRow = new DockPanel { LastChildFill = true };
             DockPanel.SetDock(_bannerReset, Dock.Right);
             bannerRow.Children.Add(_bannerReset);      // docked child first, wrapping text fills the rest
@@ -882,10 +911,23 @@ namespace FundedPath.NT
             if (rules != null && _ledger != null)
                 completed = MergeLedger(d.Completed, today);
 
+            // PER-DAY RUNS HAND THE ENGINE ZERO COMPLETED DAYS. That single line IS the mode: with
+            // nothing to accumulate the balance is StartBalance + today's realized P&L, and with no
+            // close to ratchet from the floor sits flat at StartBalance - MaxLoss all day and never
+            // moves. Both fall out of the days the engine is GIVEN, so ChallengeEngine.Evaluate stays
+            // a pure function of its arguments and never learns this mode exists - deliberately: the
+            // arithmetic that decides a breach is identical in both modes and is not touched, let
+            // alone re-tested, by this change.
+            //
+            // The ledger is still merged and still written above. In this mode it is a SCORECARD -
+            // one row per day, each carrying its own P&L - and it reaches the engine nowhere.
+            bool perDay = rules != null && PerDay;
+            List<TradingDay> forEngine = perDay ? new List<TradingDay>() : completed;
+
             // The latch and the trading date are the memory this pure function cannot hold. It hands
             // back the updated latch on the state; keeping it is what makes a breach survive the tick,
             // and persisting it is what makes it survive the restart.
-            ChallengeState state = ChallengeEngine.Evaluate(rules, completed, d.OpenRealized, s.Unrealized,
+            ChallengeState state = ChallengeEngine.Evaluate(rules, forEngine, d.OpenRealized, s.Unrealized,
                                                             basis, _latched, today);
             _latched = state.Latched;
 
@@ -895,7 +937,10 @@ namespace FundedPath.NT
             f.Rules = rules;
             f.Tracked = rules != null;
             f.SessionView = _sessionView;
-            f.Days = state.Days;
+            f.PerDay = perDay;
+            // Continuous: the engine's own rows, carrying the accumulated close and the floor that
+            // ratcheted with it. PerDay: the scorecard the engine never saw.
+            f.Days = perDay ? Scorecard(completed, rules) : state.Days;
             f.Session = d.Session;
             f.Phase = phase;
             f.PhaseColor = ColorFor(phase);
@@ -940,6 +985,52 @@ namespace FundedPath.NT
             if (rules != null && state.Warnings != null) all.AddRange(state.Warnings);
             f.Warnings = all.ToArray();
             return f;
+        }
+
+        // The scorecard, and the reason PerDay is not just "hide the old days": every row stands
+        // alone, priced at the plan's start balance plus THAT DAY'S OWN P&L. Nothing is summed, so ten
+        // replay days read as ten outcomes scattered around the start balance rather than as one
+        // compounding curve, and the floor written on every row is the same flat level.
+        //
+        // Fresh rows, never the caller's - the same discipline ChallengeEngine.Evaluate keeps - so the
+        // ledger the panel persists cannot pick up a computed column by reference. And it is handed to
+        // the chart and to the rail, never to the engine: if this list ever reaches Evaluate, one of
+        // these days ratchets a high-water mark and the whole mode is a lie.
+        static List<TradingDay> Scorecard(List<TradingDay> days, PropRules r)
+        {
+            List<TradingDay> rows = new List<TradingDay>();
+            if (days == null || r == null) return rows;
+            for (int i = 0; i < days.Count; i++)
+            {
+                TradingDay s = days[i];
+                if (s == null) continue;
+                TradingDay row = new TradingDay();
+                row.Date           = s.Date;
+                row.RealizedPnL    = s.RealizedPnL;
+                row.Fills          = s.Fills;
+                row.ClosingBalance = r.StartBalance + s.RealizedPnL;   // its own day, never a running total
+                row.FloorInForce   = r.InitialFloor;                   // flat: there is no close to ratchet from
+                rows.Add(row);
+            }
+            return rows;
+        }
+
+        // What a scorecard day ENDED on. A rule break is whatever actually latched on that date and
+        // was recorded in this account's ledger - which is intraday-accurate, survives a restart and
+        // is already merged and persisted, so it needs no second store of its own. A pass is that
+        // day's own realized P&L reaching the plan's full target, which LucidPro allows in one day.
+        //
+        // A day this panel was not open for can only be scored on its P&L, so it reads "did not
+        // pass" and never "breached": that is the honest answer to "I did not see it", and it is the
+        // pessimistic one, which is the only direction this window is allowed to be wrong in.
+        Verdict DayVerdict(TradingDay d, PropRules r)
+        {
+            if (d == null || r == null) return Verdict.InProgress;
+            // FindLatch scopes a breach to the date in PerDay - which is the only mode this runs in.
+            if (FindLatch(KindBreach, d.Date) != null)  return Verdict.Breached;
+            if (FindLatch(KindDayLock, d.Date) != null) return Verdict.DailyLockout;
+            double need = GoalBalance(r) - r.StartBalance;
+            return need > 0 && d.RealizedPnL >= need - 0.005 ? Verdict.Passed : Verdict.InProgress;
         }
 
         sealed class Derived
@@ -1166,6 +1257,27 @@ namespace FundedPath.NT
                 dirty = true;
             }
 
+            // PER-DAY RUNS: the challenge latch belongs to ONE trading day, exactly as the daily
+            // lockout above already does. A breach ends that day - and stops the strategy, which is
+            // the point of it - and the next trading day is a different challenge that starts clean.
+            // In a continuous run this never fires: there the breach is the RUN's, it is what the firm
+            // recorded, and only the trader clears it.
+            //
+            // Here rather than at load, and that is what makes it right in both directions the task
+            // names: the date rolling with the panel open clears yesterday's breach, and a restart
+            // mid-day KEEPS today's, because BreachedOn is persisted and still equals today.
+            if (PerDay && _latched != null && _latched.ChallengeBreached && _latched.BreachedOn != today)
+            {
+                _latched.ChallengeBreached = false;
+                _latched.BreachedOn        = DateTime.MinValue;
+                _latched.BreachedAt        = 0.0;
+                _latched.BreachedFloor     = 0.0;
+                dirty = true;
+                NinjaTrader.Code.Output.Process(
+                    "[FundedPath] per-day run: the trading date rolled, so the previous day's breach latch is cleared with it.",
+                    NinjaTrader.NinjaScript.PrintTo.OutputTab1);
+            }
+
             // Computed rows win over stored ones for the days they cover: they are re-derived from the live
             // execution list, so they carry broker amendments and a Playback rewind's corrected history.
             // Days the executions no longer reach keep whatever the ledger holds.
@@ -1207,6 +1319,19 @@ namespace FundedPath.NT
             return merged;
         }
 
+        // Does this binding measure ONE run across days, or one independent challenge per ET
+        // trading day? Read from the binding rather than cached, because the dialog can change it
+        // mid-session and every reader below must flip on the same tick. False for an unbound
+        // account, which is measured by nothing anyway.
+        bool PerDay
+        {
+            get
+            {
+                AccountBinding b = _binding;
+                return b != null && b.RunMode == RunMode.PerDay;
+            }
+        }
+
         void LoadBindingFor(Account acct)
         {
             _binding = null;
@@ -1214,6 +1339,7 @@ namespace FundedPath.NT
             _ledger = null;
             _ledgerPath = null;
             _bindingRev++;
+            _newRun.IsEnabled = false;   // nothing bound: there is no run to restart
             // The latch records belong to the account that is going away. Cleared before the new one's
             // are loaded, or the previous challenge's breach banner would sit over this account.
             _enforcements.Clear();
@@ -1234,6 +1360,9 @@ namespace FundedPath.NT
             // same gate, one field, so the display, the subscription and the disk writes cannot disagree.
             _rules = _binding.ResolveRules();
             if (_rules == null) return;
+            // ...and only now: a binding whose plan is not modelled measures nothing and writes no
+            // ledger, so "start a new run" would clear a run that does not exist.
+            _newRun.IsEnabled = true;
 
             string dir = Path.GetDirectoryName(_bindingsPath);
             _ledgerPath = Path.Combine(dir ?? "", "days-" + SafeFileName(key) + ".xml");
@@ -1320,7 +1449,14 @@ namespace FundedPath.NT
             return rows;
         }
 
-        void SaveLedger(DateTime today)
+        void SaveLedger(DateTime today) { SaveLedger(today, false); }
+
+        // discardOldRun: write the file with NO enforcement records at all, instead of merging back
+        // the ones already on disk. Exactly one caller - the fresh-run action - because it is the one
+        // place where forgetting is what the trader just asked for and confirmed in writing. The
+        // read-modify-write below exists so a second tab cannot erase records this tab never saw;
+        // here that erasure IS the act, so it is a parameter rather than a second copy of this method.
+        void SaveLedger(DateTime today, bool discardOldRun)
         {
             if (_ledgerPath == null || _ledger == null) return;
             string dir = Path.GetDirectoryName(_ledgerPath);
@@ -1364,23 +1500,26 @@ namespace FundedPath.NT
             // the kind, so our own copy of a record replaces the file's rather than duplicating it.
             List<EnforcementRecord> outEnf = new List<EnforcementRecord>();
             List<string> enfSeen = new List<string>();
-            for (int i = 0; i < _enforcements.Count; i++)
+            if (!discardOldRun)
             {
-                EnforcementRecord rec = _enforcements[i];
-                if (rec == null || rec.TradingDate > today) continue;
-                string k = rec.AtUtc.Ticks.ToString(CultureInfo.InvariantCulture) + "|" + (rec.Kind ?? "");
-                if (enfSeen.Contains(k)) continue;
-                enfSeen.Add(k);
-                outEnf.Add(rec);
-            }
-            for (int i = 0; i < mergedEnf.Count; i++)
-            {
-                EnforcementRecord rec = mergedEnf[i];
-                if (rec == null || rec.TradingDate > today) continue;
-                string k = rec.AtUtc.Ticks.ToString(CultureInfo.InvariantCulture) + "|" + (rec.Kind ?? "");
-                if (enfSeen.Contains(k)) continue;
-                enfSeen.Add(k);
-                outEnf.Add(rec);
+                for (int i = 0; i < _enforcements.Count; i++)
+                {
+                    EnforcementRecord rec = _enforcements[i];
+                    if (rec == null || rec.TradingDate > today) continue;
+                    string k = rec.AtUtc.Ticks.ToString(CultureInfo.InvariantCulture) + "|" + (rec.Kind ?? "");
+                    if (enfSeen.Contains(k)) continue;
+                    enfSeen.Add(k);
+                    outEnf.Add(rec);
+                }
+                for (int i = 0; i < mergedEnf.Count; i++)
+                {
+                    EnforcementRecord rec = mergedEnf[i];
+                    if (rec == null || rec.TradingDate > today) continue;
+                    string k = rec.AtUtc.Ticks.ToString(CultureInfo.InvariantCulture) + "|" + (rec.Kind ?? "");
+                    if (enfSeen.Contains(k)) continue;
+                    enfSeen.Add(k);
+                    outEnf.Add(rec);
+                }
             }
             outEnf.Sort(delegate (EnforcementRecord a, EnforcementRecord b) { return a.AtUtc.CompareTo(b.AtUtc); });
             _enforcements = outEnf;
@@ -1561,10 +1700,18 @@ namespace FundedPath.NT
             _stripe.Background = phaseBrush;
             _phaseDot.Fill = phaseBrush;
             _phaseText.Foreground = phaseBrush;
-            _phaseText.Text = PhaseLabel(f.Phase) + (f.Tracked ? Dot + "day " + (f.Days.Count + 1) : "");
+            // "day 4" is a position inside a RUN. A per-day run has no such position - every day is
+            // day one - so it says what it is instead of counting toward something that never adds up.
+            _phaseText.Text = PhaseLabel(f.Phase) +
+                (f.Tracked ? Dot + (f.PerDay ? "per-day run" : "day " + (f.Days.Count + 1)) : "");
             _phaseNote.Text = NoteFor(f.Phase);
 
-            _title.Text = (f.SessionView ? "Session Curve" : "Challenge Curve") + Dot +
+            // THE SAME PICTURE MEANS OPPOSITE THINGS in the two modes - a rising line is a compounding
+            // balance in one and a run of good days in the other - so the Challenge view is renamed
+            // outright rather than annotated. A trader reading a screenshot tomorrow gets the answer
+            // from the title, the phase chip and the RUN chip, without having to remember.
+            string viewName = f.SessionView ? "Session Curve" : (f.PerDay ? "Day Scorecard" : "Challenge Curve");
+            _title.Text = viewName + Dot +
                           f.TradingDate.ToString("MMM d", CultureInfo.InvariantCulture) +
                           (f.Tracked ? Dot + SourceLabel(f.Phase) : "");
 
@@ -1607,7 +1754,12 @@ namespace FundedPath.NT
             // which is where it belongs (and what the approved mockup shows).
             SetChip(_chips[2], SizeLabel(r.Size) + " " + RuleLabel(r.Phase));
             SetChip(_chips[3], r.HasDailyLossLimit ? Money(r.DailyLossLimit) + (r.DailyLossSoft ? " soft" : "") : "Off");
-            SetChip(_chips[4], (r.HwmBasis == HwmBasis.EodClose ? "EOD" : "Intraday") + Dot + (st.FloorLocked ? "locked" : "trailing"));
+            SetChip(_chips[4], f.PerDay
+                ? (r.HwmBasis == HwmBasis.EodClose ? "EOD" : "Intraday") + Dot + "flat"
+                : (r.HwmBasis == HwmBasis.EodClose ? "EOD" : "Intraday") + Dot + (st.FloorLocked ? "locked" : "trailing"));
+            // The mode, spelled out, in the row that states this account's configuration. Every other
+            // number on this screen is read differently depending on this one word.
+            SetChip(_chips[5], f.PerDay ? "Per-day" : "Continuous");
 
             _untrackedCard.Root.Visibility = Visibility.Collapsed;
             for (int i = 0; i < _cards.Length; i++) _cards[i].Root.Visibility = Visibility.Visible;
@@ -1639,10 +1791,17 @@ namespace FundedPath.NT
                 st.DayPnL < 0 ? Red : (st.DayPnL > 0 ? Green : TextCol));
 
             // Card 4 - Floor status. "Locked" is the good news: the drawdown has stopped trailing forever.
-            SetCard(_cards[3], "FLOOR STATUS",
-                st.FloorLocked ? "Locked" : "Trailing",
-                st.FloorLocked ? "frozen at " + Money(st.Floor) : "ratchets on the session close",
-                st.FloorLocked ? Green : Muted);
+            // In a per-day run neither word applies: there are no completed closes to ratchet from, so
+            // the floor is the same level every day and "ratchets on the session close" would be a lie
+            // about the rule the trader is actually trading against.
+            if (f.PerDay)
+                SetCard(_cards[3], "FLOOR STATUS", "Flat",
+                    "per-day run" + Dot + Money(st.Floor) + " every day - it never ratchets", Muted);
+            else
+                SetCard(_cards[3], "FLOOR STATUS",
+                    st.FloorLocked ? "Locked" : "Trailing",
+                    st.FloorLocked ? "frozen at " + Money(st.Floor) : "ratchets on the session close",
+                    st.FloorLocked ? Green : Muted);
 
             // Card 5 - Trading days in the Challenge view; the mockup's Fills Today in the Session view,
             // because a day count says nothing about the session you are inside.
@@ -1665,6 +1824,28 @@ namespace FundedPath.NT
                 if (f.FillsToday > 0) split += Dot + f.FillsToday.ToString(CultureInfo.InvariantCulture) + " fills";
                 SetCard(_cards[4], "TRADES TODAY",
                     f.Session.Count.ToString(CultureInfo.InvariantCulture), split, TextCol);
+            }
+            else if (f.PerDay)
+            {
+                // A qualifying-day count answers "how far through the run am I", which a per-day run
+                // does not ask. This is the whole product of the mode: he ran the strategy over ten
+                // replay days and wants to know how many of them passed.
+                int passed = 0, broke = 0;
+                for (int i = 0; i < f.Days.Count; i++)
+                {
+                    Verdict dv = DayVerdict(f.Days[i], r);
+                    if (dv == Verdict.Passed) passed++;
+                    else if (dv == Verdict.Breached || dv == Verdict.DailyLockout) broke++;
+                }
+                double dayTarget = GoalBalance(r) - r.StartBalance;
+                string sub = f.Days.Count == 0
+                    ? "no completed day on the scorecard yet"
+                    : "days passed, each judged on its own" +
+                      (broke > 0 ? Dot + broke.ToString(CultureInfo.InvariantCulture) + " broke a rule" : "") +
+                      (dayTarget > 0 ? Dot + Money(dayTarget) + " passes a day" : "");
+                SetCard(_cards[4], "DAYS PASSED",
+                    passed.ToString(CultureInfo.InvariantCulture) + " of " + f.Days.Count.ToString(CultureInfo.InvariantCulture),
+                    sub, passed > 0 ? Green : Muted);
             }
             else
             {
@@ -1842,9 +2023,13 @@ namespace FundedPath.NT
                 SetCard(_untrackedCard, "UNTRACKED", "No account",
                     "Pick an account in the box above, then press Configure.", Dim);
             else
+                // A binding whose plan is not modelled lands here too, and it DOES carry a run mode -
+                // so the one screen that says "nothing is being measured" also says how it would be.
                 SetCard(_untrackedCard, "UNTRACKED", "Not measured",
                     "No challenge is bound to this account. Nothing is measured and nothing is written to disk. " +
-                    "Press Configure to bind it.", Dim);
+                    "Press Configure to bind it." +
+                    (_binding == null ? "" : " This account's binding counts days " +
+                        (PerDay ? "per day - each day its own challenge." : "continuously - one running challenge.")), Dim);
         }
 
         // Configure and the combo's placeholder answer one question - is there an account to configure
@@ -2096,16 +2281,21 @@ namespace FundedPath.NT
             });
         }
 
-        // A challenge breach is latched for the whole challenge - it is what the firm recorded, and no
-        // new day undoes it. A daily lockout belongs to ONE trading day and is gone when the day rolls,
+        // A challenge breach is latched for the whole RUN - it is what the firm recorded, and no new
+        // day undoes it. A daily lockout belongs to ONE trading day and is gone when the day rolls,
         // which is what the rule itself does.
+        //
+        // In a per-day run the run IS the day, so the breach is scoped exactly like the lockout: the
+        // banner comes down with the date, and the next day's breach is a fresh edge that enforces
+        // again. Without this the first breached replay day would keep the banner up, and would keep
+        // an armed account from ever being stopped again.
         EnforcementRecord FindLatch(string kind, DateTime today)
         {
             for (int i = _enforcements.Count - 1; i >= 0; i--)
             {
                 EnforcementRecord r = _enforcements[i];
                 if (r == null || r.Kind != kind) continue;
-                if (kind == KindBreach || r.TradingDate == today) return r;
+                if ((kind == KindBreach && !PerDay) || r.TradingDate == today) return r;
             }
             return null;
         }
@@ -2160,10 +2350,19 @@ namespace FundedPath.NT
                 ? "BREACHED" + Dot + Money(Math.Max(0.0, -rec.Value)) + " below the floor"
                 : "DAY LOCKED" + Dot + Signed(rec.Value) + " on the day";
 
+            // The same red banner means two different things. In a continuous run a breach ends the
+            // CHALLENGE and stays up until he starts a new run; in a per-day run it ends the DAY and
+            // the next trading date starts clean. Saying which is the difference between "I am out"
+            // and "that one did not work", and he must not have to remember which mode he is in.
+            if (breach && f.PerDay)
+                what += Dot + "per-day run: this DAY is over, the next one starts clean";
+
             _bannerText.Text = what + Dot + EtStamp(rec.AtUtc) + Dot + ActionLine(rec);
             _banner.Visibility = Visibility.Visible;
-            // Only a challenge breach can be reset. A daily lockout clears itself when the day rolls,
-            // exactly as the rule does, so a button for it would be a button that lies.
+            // Offered on a challenge breach only. A daily lockout clears itself when the day rolls,
+            // exactly as the rule does, so offering to start a new run over it would be offering to
+            // throw away a run to fix something that fixes itself in an hour. The bar's copy of the
+            // button is always there for the trader who wants it anyway.
             _bannerReset.Visibility = breach ? Visibility.Visible : Visibility.Collapsed;
 
             string full = what + "\n" + EtStamp(rec.AtUtc) + " - " + (rec.Headline ?? "") + "\n\n" + (rec.Detail ?? "");
@@ -2330,43 +2529,105 @@ namespace FundedPath.NT
 
         // ---- interaction ----------------------------------------------------------------------------
 
-        void OnResetBreachClick(object sender, RoutedEventArgs e)
+        // ONE action, reachable from the bar and from the breach banner, because the trader asked one
+        // question - WHEN DOES A RUN END? - and this is its answer in both modes. It ends when he says
+        // so, and everything this panel remembers about the old one stops counting toward the new one.
+        //
+        // Nothing is deleted. The run's first day is moved to today, which is the SAME filter the
+        // binding dialog's "first day counted" already applies: MergeLedger drops every ledger day
+        // that closed before it, and the rows stay in the file. A mistyped reset must not destroy
+        // history the platform cannot rebuild - Account.Executions reaches back three days, and a
+        // missing winning day lowers the high-water mark, lowers the floor, and reports more room
+        // than the trader has. The latch and the enforcement records DO go, because those are what
+        // would otherwise keep the old run's breach on the screen of a run that no longer exists.
+        void OnFreshRunClick(object sender, RoutedEventArgs e)
         {
+            AccountBinding b = _binding;
             CockpitFrame f = _frame;
-            if (f == null) return;
-            if (FindLatch(KindBreach, f.TradingDate) == null) return;
+            if (b == null || f == null || _rules == null) return;
 
+            DateTime today = f.TradingDate;
             string name = _account != null ? _account.DisplayName : "this account";
+            bool latched = FindLatch(KindBreach, today) != null;
+
             string question =
-                "Clear the latched breach on " + name + "?\n\n" +
-                "This clears what THIS PANEL shows and records. It does NOT undo anything your firm has " +
-                "already recorded: if they logged the breach, the account is still breached with them, and " +
-                "this button cannot give it back.\n\n" +
-                "It does not reopen a position or restart a strategy either. And if the account is still " +
-                "under its floor, the panel will latch again on the very next tick - and act again, if " +
-                "enforcement is armed for this account.";
+                "Start a new run on " + name + ", beginning today (" +
+                today.ToString("MMM d yyyy", CultureInfo.InvariantCulture) + ")?\n\n" +
+                "From now on this panel counts only today onwards. Every day already recorded stops " +
+                "counting toward the run" + (latched ? ", the latched breach is cleared" : "") +
+                ", and the record of anything this panel did about a rule break is dropped. The new run " +
+                "starts at " + Money(_rules.StartBalance) + ", with the floor back at " +
+                Money(_rules.SeededFloor) + ".\n\n" +
+                "IT CHANGES ONLY WHAT THIS PANEL REMEMBERS. It undoes nothing your firm has recorded: " +
+                "if they logged a breach, the account is still breached with them, and this cannot give " +
+                "it back. It does not reopen a position or restart a strategy either - and if the account " +
+                "is still under its floor, the panel will latch again on the very next tick, and act " +
+                "again if enforcement is armed for this account.\n\n" +
+                "Your day-by-day history stays in the ledger file. It simply stops counting toward this run.";
 
             MessageBoxResult answer;
             try
             {
                 Window owner = Window.GetWindow(this);
                 answer = owner != null
-                    ? MessageBox.Show(owner, question, "Funded Path - reset the latched breach", MessageBoxButton.OKCancel, MessageBoxImage.Warning)
-                    : MessageBox.Show(question, "Funded Path - reset the latched breach", MessageBoxButton.OKCancel, MessageBoxImage.Warning);
+                    ? MessageBox.Show(owner, question, "Funded Path - start a new run", MessageBoxButton.OKCancel, MessageBoxImage.Warning)
+                    : MessageBox.Show(question, "Funded Path - start a new run", MessageBoxButton.OKCancel, MessageBoxImage.Warning);
             }
             catch { return; }   // no dialog, no reset: this is not a decision to take on his behalf
 
             if (answer != MessageBoxResult.OK) return;
 
-            for (int i = _enforcements.Count - 1; i >= 0; i--)
-                if (_enforcements[i] != null && _enforcements[i].Kind == KindBreach) _enforcements.RemoveAt(i);
+            // Re-read the store first, exactly as OnConfigureClick does: another tab of this window may
+            // have bound a different account since this one loaded, and Save rewrites the whole file
+            // from the instance it is handed. A store that FAILED to load is not swapped in.
+            BindingStore fresh = BindingStore.Load(_bindingsPath);
+            if (string.IsNullOrEmpty(fresh.LastLoadError)) _store = fresh;
 
-            // A fresh latch is how the engine's own contract says to reset one - there is no Clear() on
-            // LatchedState on purpose, so that clearing a live breach is always an explicit act.
+            AccountBinding target = _store.Find(b.AccountKey);
+            if (target == null) target = b;                  // not in the re-read file: keep ours rather than lose the act
+            target.StartedUtc = DateTime.SpecifyKind(today, DateTimeKind.Utc);
+            _store.Put(target);
+
+            // FAIL CLOSED. If the new first day does not reach disk, clearing the latch below would
+            // leave the panel having forgotten the breach while still counting the old run's days -
+            // the worst of both. Say so and change nothing.
+            try { _store.Save(_bindingsPath); }
+            catch (Exception ex)
+            {
+                _storeError = "Could not save the new run's first day: " + ex.Message;
+                NinjaTrader.Code.Output.Process("[FundedPath] new run NOT started - " + ex,
+                    NinjaTrader.NinjaScript.PrintTo.OutputTab1);
+                try { MessageBox.Show("The new run was NOT started: " + ex.Message, "Funded Path", MessageBoxButton.OK, MessageBoxImage.Error); }
+                catch { }
+                return;
+            }
+
+            // A fresh latch is how the engine's own contract says to clear one - there is no Clear()
+            // on LatchedState on purpose, so that clearing a live breach is always an explicit act.
             _latched = new LatchedState();
-            PersistEnforcement(f.TradingDate);
-            NinjaTrader.Code.Output.Process("[FundedPath] the latched breach on " + name +
-                " was cleared by hand. Nothing at the firm changed.", NinjaTrader.NinjaScript.PrintTo.OutputTab1);
+            _enforcements.Clear();
+            _enforcingRec = null;
+            _enforceRetryDeadline = DateTime.MinValue;
+            try { SaveLedger(today, true); }
+            catch (Exception ex)
+            {
+                // The days are already filtered by the saved start date, so the run IS new. Only the
+                // old records survive on disk, and LoadBindingFor below would read them straight back.
+                _storeError = "The new run started, but the old run's enforcement records could not be " +
+                              "cleared from the day ledger: " + ex.Message;
+                NinjaTrader.Code.Output.Process("[FundedPath] new run: ledger not rewritten - " + ex,
+                    NinjaTrader.NinjaScript.PrintTo.OutputTab1);
+            }
+
+            // Reload everything from the store, the same one line OnConfigureClick uses. The account
+            // and its tracked-ness have not changed, so the subscription stands.
+            LoadBindingFor(_account);
+
+            NinjaTrader.Code.Output.Process("[FundedPath] a new run was started on " + name + " from " +
+                today.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture) +
+                ". Nothing at the firm changed.", NinjaTrader.NinjaScript.PrintTo.OutputTab1);
+
+            _chart.Clear();                 // the old run's curve is not this one's
             _forceRecompute = true;
             RenderBanner(f);
         }
@@ -2696,7 +2957,8 @@ namespace FundedPath.NT
                 _accountSelectionHandler = null;
             }
             _configure.Click -= OnConfigureClick;
-            _bannerReset.Click -= OnResetBreachClick;
+            _newRun.Click -= OnFreshRunClick;
+            _bannerReset.Click -= OnFreshRunClick;
             if (_paintTimer != null)
             {
                 // Stop AND null: a stopped-but-alive timer still holds its Tick delegate, which holds this

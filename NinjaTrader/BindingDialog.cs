@@ -59,6 +59,8 @@ namespace FundedPath.NT
         private ComboBox     _plan;
         private ComboBox     _size;
         private ComboBox     _phase;
+        private RadioButton  _runContinuous;
+        private RadioButton  _runPerDay;
         private CheckBox     _dll;
         private RadioButton  _basisEquity;
         private RadioButton  _basisBalance;
@@ -98,11 +100,13 @@ namespace FundedPath.NT
             // NTWindow paints its own chrome from Caption; Window.Title is ignored by it.
             Caption               = "Challenge binding";
             Width                 = 480;
-            // Two money rows with their own explanation lines, plus the enforcement section - which is
-            // deliberately the tallest thing in the window, because a control that can close positions
-            // has to be read, not skimmed. Fixed height and NoResize, so this number is the only thing
-            // standing between that section and being clipped off the bottom.
-            Height                = 880;
+            // Two money rows with their own explanation lines, the run-mode group, plus the
+            // enforcement section - which is deliberately the tallest thing in the window, because a
+            // control that can close positions has to be read, not skimmed. Tall enough to show all
+            // of it at once on a 1080-row screen; the form scrolls if the machine has less, so this
+            // number is a comfort setting now and no longer the only thing standing between the
+            // enforcement section and the bottom edge.
+            Height                = 960;
             ResizeMode            = ResizeMode.NoResize;
             ShowInTaskbar         = false;
             WindowStartupLocation = WindowStartupLocation.CenterOwner;
@@ -140,7 +144,18 @@ namespace FundedPath.NT
             // sits above them, and the form gets everything left over.
             root.Children.Add(buttons);
             root.Children.Add(_hint);
-            root.Children.Add(BuildForm());
+            // The form scrolls; the header, the hint and the buttons do not. This window is
+            // NoResize with a fixed height, so before this every row added to the form pushed the
+            // enforcement section further past the bottom edge - silently, because a Grid just clips
+            // what does not fit. Now the overflow is reachable instead of gone.
+            root.Children.Add(new ScrollViewer
+            {
+                Content                       = BuildForm(),
+                VerticalScrollBarVisibility   = ScrollBarVisibility.Auto,
+                HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled,
+                Background                    = Ground,
+                BorderThickness               = new Thickness(0)
+            });
 
             return root;
         }
@@ -209,6 +224,32 @@ namespace FundedPath.NT
             AddRow("Account size", _size);
             AddRow("Phase", _phase);
 
+            // ---- what a RUN is, which is what makes every number below mean something ----------
+            // Continuous is the default here and in the store, for every binding old and new: it is
+            // what this add-on has always done, and it is how a real evaluation is actually traded.
+            // The other option is not a lesser mode - it is a different question ("did THIS day
+            // pass?"), which is the only question worth asking when a strategy is being judged one
+            // replay day at a time. So both options say what they DO, not which one is normal.
+            _runContinuous = MakeRadio("RunMode", "One running challenge - the way a real evaluation runs", false);
+            _runPerDay     = MakeRadio("RunMode", "Each day is its own challenge", false);
+            _runContinuous.IsChecked = true;
+            _runContinuous.Checked += OnLeafChanged;
+            _runPerDay.Checked     += OnLeafChanged;
+
+            StackPanel run = new StackPanel { Margin = new Thickness(0, 4, 0, 4) };
+            run.Children.Add(_runContinuous);
+            run.Children.Add(_runPerDay);
+            // Only the second option carries a paragraph, the same way the enforcement group only
+            // explains the option that changes what happens. The last two sentences are the ones the
+            // trader needs before he dares click it: this is a lens over the ledger, not a broom.
+            run.Children.Add(Explain(
+                "Every trading day starts fresh at the plan's starting balance: yesterday's profit does "
+              + "not carry into today and the floor never ratchets, so the verdict answers \"did THIS day "
+              + "pass?\" instead of \"is the run still alive?\". For judging an automated strategy day by "
+              + "day in Market Replay. It discards nothing on disk - every day already recorded stays in "
+              + "the ledger and keeps its own result. It changes what counts, not what is kept."));
+            AddRow("How days count", run);
+
             _dll = new CheckBox
             {
                 FontFamily          = Sans,
@@ -269,7 +310,8 @@ namespace FundedPath.NT
                 "Your highest END-OF-DAY balance on this account so far - it seeds the high-water mark "
               + "the drawdown floor trails from, and the floor below moves as you type. Leave it empty "
               + "if this challenge starts today. Without it the floor restarts from the start balance "
-              + "and reads LOWER than the firm's."));
+              + "and reads LOWER than the firm's. Ignored when each day is its own challenge: there is "
+              + "no run for a peak close to be a claim about."));
             AddRow("Peak day close", peak);
 
             // ---- the only control in this add-on that can act on the account --------------------
@@ -501,6 +543,8 @@ namespace FundedPath.NT
             _peak.IsEnabled     = ok;
             _basisEquity.IsEnabled  = ok;
             _basisBalance.IsEnabled = ok;
+            _runContinuous.IsEnabled = ok;
+            _runPerDay.IsEnabled     = ok;
             // Same gate as the rest: a combination the engine cannot measure has no rule to break, so
             // it must not be armable either.
             _enforceWarn.IsEnabled  = ok;
@@ -560,8 +604,22 @@ namespace FundedPath.NT
             // Same number the rail's ROOM TO FLOOR and FLOOR STATUS cards will read once this is
             // saved: the engine starts its high-water mark at PropRules.SeededHwm, so a seeded peak
             // close moves the floor the moment it is written, not on the next session close.
+            //
+            // Which is why the mode comes FIRST. Per-day feeds the engine no completed days at all,
+            // so there is no high-water mark to trail and none of the three trailing branches below
+            // is true - the floor is the flat start-minus-max-loss line, every day, and this is the
+            // only place the trader is told that before he saves.
             string floor;
-            if (preview.SeededFloor >= preview.FloorLockLevel)
+            if (_runPerDay.IsChecked == true)
+            {
+                floor = "Each day starts fresh at " + Money(preview.StartBalance) + ". Floor "
+                      + Money(preview.InitialFloor) + " - the start balance minus the max loss - flat all "
+                      + "day and the same every day: with no earlier close to trail, it never ratchets, and "
+                      + "neither yesterday's profit nor the peak close above moves it.";
+                if (preview.ProfitTarget > 0.0)
+                    floor += " A day passes at " + Money(preview.TargetBalance) + ", the plan's full target.";
+            }
+            else if (preview.SeededFloor >= preview.FloorLockLevel)
                 floor = "Floor " + Money(preview.SeededFloor) + ", already locked - a close at or above "
                       + Money(preview.TrailStopClose) + " freezes the floor there for good, and your peak "
                       + "close is past it.";
@@ -619,6 +677,7 @@ namespace FundedPath.NT
                     // Warn-only, always, for every new binding. Never carried over from another
                     // account: arming is a decision made once per account, out loud.
                     _enforceWarn.IsChecked = true;
+                    _runContinuous.IsChecked = true;
                     _start.SelectedDate    = null;
                     _override.Text         = "";
                     _peak.Text             = "";
@@ -633,6 +692,11 @@ namespace FundedPath.NT
                     // fresh window each time and an unset pair would render as neither chosen.
                     _enforceAct.IsChecked   = b.Enforcement == EnforcementMode.Armed;
                     _enforceWarn.IsChecked  = b.Enforcement != EnforcementMode.Armed;
+                    // Both directions again, and biased the same way: a bindings.xml written before
+                    // this option existed carries no run mode, the store falls back to Continuous,
+                    // and the account keeps behaving exactly as it did yesterday.
+                    _runPerDay.IsChecked     = b.RunMode == RunMode.PerDay;
+                    _runContinuous.IsChecked = b.RunMode != RunMode.PerDay;
                     // MinValue is the store's "not set", which here means "count every day in the
                     // ledger" - a blank picker, not a date the trader never chose.
                     _start.SelectedDate = b.StartedUtc == DateTime.MinValue
@@ -779,6 +843,11 @@ namespace FundedPath.NT
                                      ? EnforcementMode.Armed
                                      : EnforcementMode.WarnOnly;
             b.BreachBasis          = _basisBalance.IsChecked == true ? BreachBasis.Balance : BreachBasis.Equity;
+            // IsEnabled-guarded like the two above: a combination the engine cannot measure is
+            // written Continuous, which is the default for every binding, old and new.
+            b.RunMode              = _runPerDay.IsEnabled && _runPerDay.IsChecked == true
+                                     ? RunMode.PerDay
+                                     : RunMode.Continuous;
             b.StartBalanceOverride = over;
             b.PeakEodCloseSeed     = peak;
             b.Notes                = "";

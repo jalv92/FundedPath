@@ -395,15 +395,19 @@ namespace FundedPath.NT
             _dailyY  = _plotB - (_dailyLimit - vBot) / vSpan * ph;
 
             _balLine   = BuildSpline(balPts,   false, 0);
-            // The floor is a STEP, not a curve - see BuildStep. It used to run through BuildSpline for
-            // visual consistency with the balance, and on a real two-point challenge that turned a
-            // single overnight ratchet into a diagonal creeping across the whole plot: it read as the
-            // drawdown drifting up all day, on a day with no trades at all.
-            _floorLine = BuildStep(floorPts, false, 0);
+            // SMOOTHED, by the trader's decision (2026-08-22), taken with the trade-off in front of him.
+            // The floor is really a step: it moves once, at the session close, and holds flat all day.
+            // Drawing it smoothed spreads that one jump across the gap between two days, which on a
+            // two-day challenge reads as a drawdown creeping upward through a day with no trades - he
+            // hit exactly that and reported it as a bug. BuildStep is kept below and is one word away.
+            // What makes the smoothed version safe to ship is that no NUMBER is ever interpolated: the
+            // hover readout, the rail and the engine all report the exact stepped value for that day.
+            // Only the line between two points is a curve.
+            _floorLine = BuildSpline(floorPts, false, 0);
             // No wash under a single point: the fill would be a 6px-wide sliver dropping to the plot
             // floor - a rendering artefact, not a gradient. Day one draws its two marks and nothing else.
             _balFill   = n > 1 ? BuildSpline(balPts,   true, _plotB) : null;
-            _floorFill = n > 1 ? BuildStep(floorPts, true, _plotB) : null;
+            _floorFill = n > 1 ? BuildSpline(floorPts, true, _plotB) : null;
 
             // --- gutter ticks that survive: inside the plot band, and not sitting on the target label.
             var keepFt = new List<FormattedText>();
@@ -466,7 +470,10 @@ namespace FundedPath.NT
         // under the red floor when it never did. The mockup's rounded peaks ARE that overshoot, so it
         // stays. If it ever misleads, clamp c1.Y/c2.Y into [min(p1.Y,p2.Y), max(p1.Y,p2.Y)] - two lines,
         // and the cubic's convex hull then guarantees the drawn curve never leaves the data's range.
-        // The drawdown floor, drawn as what it is: a step function.
+        // The drawdown floor drawn as what it literally is: a step function. NOT currently used -
+        // the trader chose the smoothed line above with this trade-off explained. Kept because the
+        // choice is a preference that may flip back, and because it documents what the rule actually
+        // does better than any comment could.
         //
         // An end-of-day trailing floor moves ONCE, at the session close, and holds flat for the whole
         // day. Interpolating between two days therefore draws a rule that does not exist. It was smoothed

@@ -28,6 +28,32 @@ namespace FundedPath.Engine
         Armed
     }
 
+    // WHEN DOES A RUN END? The trader asked two things -- "counting the previous days should be
+    // optional, in Playback it often makes no sense" and "yesterday made $700 and I want to start the
+    // next day from zero" -- and they are the same question, so they get one answer and not two
+    // settings.
+    //
+    // Continuous is what an old bindings.xml loads as: the element did not exist before this change,
+    // so every binding already on disk comes back with no value and the parser's fallback is this
+    // first member. A mode the trader did not choose must never be the one that discards his history.
+    public enum RunMode
+    {
+        // A run spans many days. Completed days accumulate into the balance, the floor ratchets on
+        // every closing high, and the challenge latch is scoped to the whole run. This is how a real
+        // evaluation is actually traded, so it stays the default everywhere.
+        Continuous,
+
+        // Every ET trading day is its own independent challenge -- which is exactly what evaluating an
+        // automated strategy in Playback is: run the day, read the verdict, jump to the next day.
+        //
+        // The caller feeds the engine ZERO completed days. Balance is then StartBalance + today's
+        // realized P&L and the floor sits flat at StartBalance - MaxLoss with no close to ratchet
+        // from: both fall out of the days the engine is handed, not out of a branch in its
+        // arithmetic. ChallengeEngine.Evaluate does not know this enum exists. The latch is scoped to
+        // the day, the way the daily lockout already is.
+        PerDay
+    }
+
     // One NT8 account mapped to one challenge. Absence of a binding is meaningful: an unbound
     // account is Verdict.Untracked, measured by nothing and recorded nowhere, which is what keeps
     // the trader's own personal live account out of the cockpit by default (spec 2).
@@ -54,6 +80,11 @@ namespace FundedPath.Engine
         // already in an older bindings.xml, which carries no such element at all: the parser falls
         // back to the same member. Nothing on disk can load as armed unless a human armed it.
         public EnforcementMode Enforcement    { get; set; }
+        // Whether this binding measures ONE run that spans days, or one independent challenge per ET
+        // trading day. Continuous for every binding already on disk and for every new one -- see the
+        // enum. The engine never learns about it: the mode decides which completed days the CALLER
+        // hands Evaluate, and the money arithmetic is identical either way.
+        public RunMode     RunMode            { get; set; }
         public string      Notes              { get; set; }   // free text, the trader's own
 
         // Resolve the catalog row for this binding and apply the trader's own options to a COPY.
@@ -105,7 +136,14 @@ namespace FundedPath.Engine
 
             // Seeded on the rules rather than passed to the engine: the engine's high-water mark
             // starts at the start balance, and this is the one number that legitimately raises it.
-            r.PeakEodCloseSeed = PeakEodCloseSeed;
+            //
+            // ...but a seed is a claim about a run that SPANS days -- "my highest close so far was
+            // 51,800". PerDay has no such run: each day is its own challenge starting at the start
+            // balance. Carried into PerDay it would leave the floor at 49,800 on a day whose rule says
+            // 48,000, so the panel would report a breach the day never had -- and on an armed account
+            // it would flatten him for it. Dropped HERE, in the one place the seed reaches the rules,
+            // so the engine, the rail and the dialog's preview cannot disagree about the floor.
+            r.PeakEodCloseSeed = RunMode == RunMode.PerDay ? 0.0 : PeakEodCloseSeed;
 
             return r;
         }
@@ -328,6 +366,7 @@ namespace FundedPath.Engine
                 new XElement("StartBalanceOverride", b.StartBalanceOverride.ToString("R", CultureInfo.InvariantCulture)),
                 new XElement("PeakEodCloseSeed", b.PeakEodCloseSeed.ToString("R", CultureInfo.InvariantCulture)),
                 new XElement("Enforcement", b.Enforcement.ToString()),
+                new XElement("RunMode", b.RunMode.ToString()),
                 new XElement("Notes", b.Notes ?? ""));
         }
 
@@ -360,6 +399,11 @@ namespace FundedPath.Engine
             // and stop strategies; the one direction that must never happen by accident is a file
             // loading as armed.
             b.Enforcement        = ParseEnum(Text(e, "Enforcement"), EnforcementMode.WarnOnly);
+            // Same fail-safe, for the same class of reason. PerDay feeds the engine zero completed
+            // days, so a binding that came back PerDay because the element was missing, empty or
+            // mistyped would silently throw away the trader's multi-day challenge: his accumulated
+            // balance, his high-water mark, and the floor that hangs off it.
+            b.RunMode            = ParseEnum(Text(e, "RunMode"), RunMode.Continuous);
             b.Notes              = Text(e, "Notes");
             return b;
         }
@@ -371,8 +415,14 @@ namespace FundedPath.Engine
         }
 
         // A hand-edited or future enum value falls back instead of throwing: an unknown phase must
-        // not take the whole bindings file down with it.
-        static T ParseEnum<T>(string s, T fallback) where T : struct
+        // not take the whole bindings file down with it. Enum.IsDefined is what rejects a bare number:
+        // Enum.TryParse("7", ...) SUCCEEDS and hands back (T)7, a member that does not exist.
+        //
+        // Public because the day ledger needs exactly this read: the PerDay scorecard stores each
+        // day's own verdict as text beside its P&L, and a verdict the file cannot produce must fall
+        // back rather than throw on the window's paint tick. One definition of "read an enum off
+        // disk", not two.
+        public static T ParseEnum<T>(string s, T fallback) where T : struct
         {
             T value;
             return Enum.TryParse(s, true, out value) && Enum.IsDefined(typeof(T), value) ? value : fallback;

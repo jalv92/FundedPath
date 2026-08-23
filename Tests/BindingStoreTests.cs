@@ -46,6 +46,7 @@ public class BindingStoreTests : IDisposable
         b.StartBalanceOverride = 154600.5;              // a fraction, to catch a locale-formatted write
         b.PeakEodCloseSeed     = 158200.25;             // ditto, and above the override so a swap shows
         b.Enforcement          = EnforcementMode.Armed;   // NOT the default, so a lost value shows up
+        b.RunMode              = RunMode.PerDay;          // NOT the default, so a lost value shows up
         b.Notes                = "second attempt, DLL on";
 
         BindingStore saved = new BindingStore();
@@ -76,6 +77,9 @@ public class BindingStoreTests : IDisposable
         // it wrong in the safe direction merely disarms him; wrong in the other direction arms an
         // account he never armed.
         Assert.Equal(b.Enforcement, got.Enforcement);
+        // Whether every day is its own challenge. Losing it in this direction quietly re-attaches the
+        // days the trader asked to stop counting; losing it in the other throws his run away.
+        Assert.Equal(b.RunMode, got.RunMode);
         Assert.Equal(b.Notes, got.Notes);
     }
 
@@ -89,7 +93,7 @@ public class BindingStoreTests : IDisposable
         List<string> covered = new List<string>(new string[] {
             "AccountKey", "AccountDisplayName", "Firm", "Plan", "Size", "Phase",
             "DailyLossLimitOn", "BreachBasis", "StartedUtc", "StartBalanceOverride",
-            "PeakEodCloseSeed", "Enforcement", "Notes"
+            "PeakEodCloseSeed", "Enforcement", "RunMode", "Notes"
         });
 
         PropertyInfo[] props = typeof(AccountBinding).GetProperties(BindingFlags.Public | BindingFlags.Instance);
@@ -189,7 +193,9 @@ public class BindingStoreTests : IDisposable
         File.WriteAllText(path,
             "<FundedPathBindings version=\"1\">" +
             "  <Binding><AccountKey>k</AccountKey><Phase>SomeFuturePhase</Phase>" +
-            "  <BreachBasis>Nonsense</BreachBasis><Enforcement>SuperArmed</Enforcement></Binding>" +
+            "  <BreachBasis>Nonsense</BreachBasis><Enforcement>SuperArmed</Enforcement>" +
+            "  <RunMode>PerWeek</RunMode></Binding>" +
+            "  <Binding><AccountKey>numeric</AccountKey><RunMode>7</RunMode></Binding>" +
             "  <Binding><AccountKey>legacy</AccountKey></Binding>" +
             "</FundedPathBindings>");
 
@@ -204,10 +210,22 @@ public class BindingStoreTests : IDisposable
         // stops strategies when it is armed, so a value it cannot read must land on WarnOnly.
         Assert.Equal(EnforcementMode.WarnOnly, b.Enforcement);
 
+        // The other fallback that changes what a challenge MEANS. PerDay feeds the engine zero
+        // completed days, so a run mode read off a corrupt or future file must land on Continuous:
+        // the mode the trader did not choose must never be the one that discards his history.
+        Assert.Equal(RunMode.Continuous, b.RunMode);
+
+        // A bare number is the trap in Enum.TryParse, which parses "7" happily and hands back a
+        // member that does not exist. Without the Enum.IsDefined guard this binding would come back
+        // in a run mode with no name and no behaviour attached to it.
+        Assert.Equal(RunMode.Continuous, store.Find("numeric").RunMode);
+
         // And the case every trader hits exactly once: a bindings.xml written before enforcement
         // existed, carrying no such element at all. Nothing on disk may load as armed -- arming is a
-        // decision a human takes in the dialog, per account.
+        // decision a human takes in the dialog, per account. The same file predates run modes, so it
+        // must come back Continuous: it is the record of a run that spans days.
         Assert.Equal(EnforcementMode.WarnOnly, store.Find("legacy").Enforcement);
+        Assert.Equal(RunMode.Continuous, store.Find("legacy").RunMode);
     }
 
     // ---- the ledger key ----
