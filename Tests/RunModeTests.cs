@@ -20,6 +20,8 @@ public class RunModeTests
     // LucidPro 50K evaluation, the numbers this whole repo is checked against:
     // start 50,000 - max loss 2,000 - floor lock at 50,100 - profit target 3,000 - DLL 1,200 if ON.
     const double Start = 50000.0, MaxLoss = 2000.0, Target = 3000.0;
+    static readonly System.DateTime Aug19 = new System.DateTime(2026, 8, 19, 0, 0, 0, System.DateTimeKind.Unspecified);
+    static readonly System.DateTime Aug20 = new System.DateTime(2026, 8, 20, 0, 0, 0, System.DateTimeKind.Unspecified);
 
     static AccountBinding Bound(RunMode mode)
     {
@@ -182,5 +184,58 @@ public class RunModeTests
         // silently forgets every day he has already traded.
         Assert.Equal(RunMode.Continuous, new AccountBinding().RunMode);
         Assert.Equal(RunMode.Continuous, default(RunMode));
+    }
+
+    // ---- the breach remembers which kind of run recorded it ----------------------------------
+    //
+    // The hole this closes: the panel used to decide whether a latched breach may clear itself by
+    // asking the BINDING what mode it is in right now. Bind an account Continuous, fail the
+    // evaluation on day 5, then days later flip the dropdown to PerDay to rehearse in Replay -- on
+    // the next tick the clear fired, because "per-day" was true and "breached on day 5" was not
+    // today. A terminal, real failure erased with no confirmation, in the one product whose entire
+    // job is to tell you whether you are still passing.
+    //
+    // The fix is provenance: the latch is stamped with the mode that BORE it. The stamp lives on
+    // LatchedState, and the two properties below are what let the caller own it safely.
+
+    [Fact]
+    public void The_engine_never_stamps_the_run_mode_itself()
+    {
+        // A12 in one assertion: Evaluate cannot know the mode exists, so it must not invent this
+        // field either. A breach born inside the engine comes out unstamped, and the caller -- the
+        // only party that knows the mode -- is what fills it in.
+        LatchedState fresh = new LatchedState();
+        ChallengeState broke = ChallengeEngine.Evaluate(
+            Bound(RunMode.Continuous).ResolveRules(), Fixtures.NoDays(),
+            -2500.0, 0.0, BreachBasis.Equity, fresh, Aug19);
+
+        Assert.True(broke.Latched.ChallengeBreached);
+        Assert.False(broke.Latched.BreachedPerDay);
+    }
+
+    [Fact]
+    public void A_stamped_breach_keeps_its_stamp_through_every_later_tick()
+    {
+        // The stamp is written once, on the tick the breach is born, and must survive everything
+        // after it -- including a recovery back above the floor, which is exactly when a trader is
+        // most tempted to go looking at the dropdown. If a later Evaluate could reset it, the
+        // provenance would be worth nothing and the erasure above comes straight back.
+        LatchedState perDayBreach = new LatchedState
+        {
+            ChallengeBreached = true,
+            BreachedOn        = Aug19,
+            BreachedAt        = 47500.0,
+            BreachedFloor     = 48000.0,
+            BreachedPerDay    = true
+        };
+
+        // Recovered: well above the floor, on a later day, in the other mode's shape (no days fed).
+        ChallengeState later = ChallengeEngine.Evaluate(
+            Bound(RunMode.Continuous).ResolveRules(), Fixtures.NoDays(),
+            1500.0, 0.0, BreachBasis.Equity, perDayBreach, Aug20);
+
+        Assert.True(later.Latched.ChallengeBreached);
+        Assert.True(later.Latched.BreachedPerDay);
+        Assert.Equal(Aug19, later.Latched.BreachedOn);
     }
 }

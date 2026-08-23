@@ -25,6 +25,16 @@ namespace FundedPath.Engine
         public double   BreachedAt { get; set; }
         public double   BreachedFloor { get; set; }
 
+        // Which kind of run recorded this breach - NOT which kind the binding is set to now. A
+        // per-day breach ends its day and is cleared when the date rolls; a continuous breach is the
+        // RUN's and only the trader clears it. Asking the binding instead of the latch means flipping
+        // the mode on a bound account re-reads an old breach under the new mode's rules, which erases
+        // a real, terminal evaluation failure the moment somebody switches to per-day to rehearse in
+        // Replay. The engine never sets this - it cannot know the mode (A12); the caller stamps it at
+        // the one tick the breach is born. False on a latch written before this field existed, which
+        // is the safe direction: an old breach stays put rather than clearing itself.
+        public bool     BreachedPerDay { get; set; }
+
         // The ET trading date the daily loss limit was hit, DateTime.MinValue when no day is locked,
         // and the day's P&L at the moment it bit. Scoped to that day: it clears when the trading date
         // changes, never when the P&L improves. A soft limit locks the day, never the account.

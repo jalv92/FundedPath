@@ -927,9 +927,18 @@ namespace FundedPath.NT
             // The latch and the trading date are the memory this pure function cannot hold. It hands
             // back the updated latch on the state; keeping it is what makes a breach survive the tick,
             // and persisting it is what makes it survive the restart.
+            // Read BEFORE the call: Evaluate hands back an updated COPY, so this is the only moment
+            // the edge from "not breached" to "breached" can be seen from out here.
+            bool wasBreached = _latched.ChallengeBreached;
             ChallengeState state = ChallengeEngine.Evaluate(rules, forEngine, d.OpenRealized, s.Unrealized,
                                                             basis, _latched, today);
             _latched = state.Latched;
+            // Stamp the breach with the mode that recorded it, here rather than in the engine, which
+            // is not allowed to know the mode exists. Only on the birth tick: re-stamping every tick
+            // would rewrite an old breach's provenance the instant the trader changed the dropdown,
+            // which is the whole failure this field exists to stop.
+            if (_latched.ChallengeBreached && !wasBreached)
+                _latched.BreachedPerDay = perDay;
 
             CockpitPhase phase = PhaseOf(acct, binding, rules);
             CockpitFrame f = new CockpitFrame();
@@ -1260,13 +1269,17 @@ namespace FundedPath.NT
             // PER-DAY RUNS: the challenge latch belongs to ONE trading day, exactly as the daily
             // lockout above already does. A breach ends that day - and stops the strategy, which is
             // the point of it - and the next trading day is a different challenge that starts clean.
-            // In a continuous run this never fires: there the breach is the RUN's, it is what the firm
-            // recorded, and only the trader clears it.
+            // Gated on the LATCH's own stamp, never on the binding's current mode. A breach recorded
+            // by a continuous run is the RUN's - what the firm recorded - and only the trader clears
+            // it, so it must stay put even after the dropdown is flipped to per-day; asking the
+            // binding instead let a real, terminal evaluation failure be erased on the next tick by
+            // somebody switching modes to rehearse in Replay.
             //
             // Here rather than at load, and that is what makes it right in both directions the task
             // names: the date rolling with the panel open clears yesterday's breach, and a restart
             // mid-day KEEPS today's, because BreachedOn is persisted and still equals today.
-            if (PerDay && _latched != null && _latched.ChallengeBreached && _latched.BreachedOn != today)
+            if (_latched != null && _latched.ChallengeBreached && _latched.BreachedPerDay
+                && _latched.BreachedOn != today)
             {
                 _latched.ChallengeBreached = false;
                 _latched.BreachedOn        = DateTime.MinValue;
@@ -1545,6 +1558,7 @@ namespace FundedPath.NT
                 root.Add(new XElement("Latch",
                     new XAttribute("breached", _latched.ChallengeBreached ? "true" : "false"),
                     new XAttribute("on", Ymd(_latched.BreachedOn)),
+                    new XAttribute("perDay", _latched.BreachedPerDay ? "true" : "false"),
                     new XAttribute("at", _latched.BreachedAt.ToString("R", CultureInfo.InvariantCulture)),
                     new XAttribute("floor", _latched.BreachedFloor.ToString("R", CultureInfo.InvariantCulture)),
                     new XAttribute("lockDate", Ymd(_latched.DailyLockoutDate)),
@@ -2461,6 +2475,10 @@ namespace FundedPath.NT
 
                 latch.ChallengeBreached = string.Equals((string)e.Attribute("breached"), "true", StringComparison.OrdinalIgnoreCase);
                 latch.BreachedOn       = ParseYmd((string)e.Attribute("on"));
+                // Absent on a file written before this field existed -> false -> the breach is treated
+                // as a continuous run's and never clears itself. The cautious direction: the trader
+                // can always clear it with NEW RUN, but nothing can silently un-fail him.
+                latch.BreachedPerDay   = string.Equals((string)e.Attribute("perDay"), "true", StringComparison.OrdinalIgnoreCase);
                 latch.BreachedAt       = ParseR((string)e.Attribute("at"));
                 latch.BreachedFloor    = ParseR((string)e.Attribute("floor"));
                 latch.DailyLockoutDate = ParseYmd((string)e.Attribute("lockDate"));
