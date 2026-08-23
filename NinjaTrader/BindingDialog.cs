@@ -62,6 +62,9 @@ namespace FundedPath.NT
         private RadioButton  _runContinuous;
         private RadioButton  _runPerDay;
         private CheckBox     _dll;
+        // The DLL caption is rewritten on every refresh, so it cannot be a string handed to Content
+        // once - it is a TextBlock that lives as long as the box and only ever has its Text swapped.
+        private TextBlock    _dllLabel;
         private RadioButton  _basisEquity;
         private RadioButton  _basisBalance;
         private RadioButton  _enforceWarn;
@@ -99,15 +102,22 @@ namespace FundedPath.NT
 
             // NTWindow paints its own chrome from Caption; Window.Title is ignored by it.
             Caption               = "Challenge binding";
-            Width                 = 480;
-            // Two money rows with their own explanation lines, the run-mode group, plus the
-            // enforcement section - which is deliberately the tallest thing in the window, because a
-            // control that can close positions has to be read, not skimmed. Tall enough to show all
-            // of it at once on a 1080-row screen; the form scrolls if the machine has less, so this
-            // number is a comfort setting now and no longer the only thing standing between the
-            // enforcement section and the bottom edge.
-            Height                = 960;
-            ResizeMode            = ResizeMode.NoResize;
+            // Resizable, and the numbers below are only where it OPENS. It shipped NoResize at a
+            // fixed 480x960, which was survivable until the run-mode group and the enforcement
+            // paragraph went in: on a smaller screen, or at any Windows scaling above 100%, the
+            // trader was left with sentences clipped at the right edge and no way to widen the one
+            // window in this add-on that explains what closing his positions means. A dialog whose
+            // whole job is to be read has no business refusing to be made bigger.
+            Width                 = 520;
+            // Open tall enough to show the enforcement section without scrolling, but never taller
+            // than the screen it opens on - a fixed 960 is off the bottom of a scaled 1080 desktop,
+            // which is how the Save button ends up somewhere the mouse cannot reach.
+            Height                = Math.Min(960.0, SystemParameters.WorkArea.Height * 0.92);
+            // The floor for both: below this the two-column form stops being readable rather than
+            // just cramped, and there is no reason to let the window be dragged into that state.
+            MinWidth              = 420;
+            MinHeight             = 380;
+            ResizeMode            = ResizeMode.CanResize;
             ShowInTaskbar         = false;
             WindowStartupLocation = WindowStartupLocation.CenterOwner;
             Background            = Ground;
@@ -250,8 +260,10 @@ namespace FundedPath.NT
               + "the ledger and keeps its own result. It changes what counts, not what is kept."));
             AddRow("How days count", run);
 
+            _dllLabel = WrapLabel("");
             _dll = new CheckBox
             {
+                Content             = _dllLabel,
                 FontFamily          = Sans,
                 FontSize            = 12,
                 Foreground          = Text,
@@ -559,7 +571,7 @@ namespace FundedPath.NT
                 _dll.IsEnabled = true;
                 // The caption states the STATE, not the option on offer. An unchecked box captioned
                 // "ON - $1,200" reads at a glance as the exact opposite of what it does.
-                _dll.Content = _dll.IsChecked == true
+                _dllLabel.Text = _dll.IsChecked == true
                     ? "ON - " + Money(amount) + " counted (soft: locks the day, not the account)"
                     : "OFF - not counted (would be " + Money(amount) + " if you bought it ON)";
                 _dll.Foreground = Text;
@@ -572,7 +584,7 @@ namespace FundedPath.NT
                 _loading = true;
                 _dll.IsChecked = false;
                 _loading = false;
-                _dll.Content    = ok ? "not offered on this plan and phase" : "-";
+                _dllLabel.Text  = ok ? "not offered on this plan and phase" : "-";
                 _dll.Foreground = Dim;
             }
 
@@ -1036,11 +1048,24 @@ namespace FundedPath.NT
         // One factory for both radio groups. The enforcement group needs its dangerous option to
         // carry more weight than its safe one - semibold and red against plain text - and that is a
         // flag rather than a second factory, so the two groups cannot drift apart on font or spacing.
+        // Every label that can outgrow the window goes through here. Returns a TextBlock rather
+        // than a string so the host control's ContentPresenter is given something that knows how to
+        // wrap; FontFamily, FontSize, FontWeight and Foreground are all inherited properties, so the
+        // caller keeps setting them on the control itself and this stays a one-liner.
+        private static TextBlock WrapLabel(string label)
+        {
+            return new TextBlock { Text = label, TextWrapping = TextWrapping.Wrap };
+        }
+
         private static RadioButton MakeRadio(string group, string label, bool danger)
         {
             return new RadioButton
             {
-                Content    = label,
+                // A bare string in a ContentPresenter does not wrap - it clips at the edge, silently,
+                // which is how "flatten and stop the st" ended up being the whole description of the
+                // control that closes your positions. Wrapping is done by the TextBlock; weight and
+                // colour stay on the RadioButton because both properties inherit down into it.
+                Content    = WrapLabel(label),
                 GroupName  = group,
                 FontFamily = Sans,
                 FontSize   = 12,
