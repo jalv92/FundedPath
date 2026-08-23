@@ -1,7 +1,39 @@
+using System;
 using System.Collections.Generic;
 
 namespace FundedPath.Engine
 {
+    // What a firm remembers about you and a pure function cannot: you touched it, the day is over.
+    //
+    // ChallengeEngine.Evaluate is a function of the CURRENT state only, so a breach used to live for
+    // exactly one tick -- the moment the day's loss recovered above the limit, or equity recovered
+    // above the floor, the window went back to saying ON TRACK. The latch is the memory, and it is
+    // OWNED AND PERSISTED BY THE CALLER: Evaluate never mutates the instance it is handed, it hands
+    // back an updated copy on ChallengeState.Latched.
+    //
+    // Resetting the challenge is handing back a fresh LatchedState. There is no Clear() on purpose:
+    // "new" is the explicit act, and a method would invite a caller to clear a live breach in place.
+    public sealed class LatchedState
+    {
+        // Terminal. Once true it stays true through any recovery, and only a reset takes it back off.
+        public bool ChallengeBreached { get; set; }
+
+        // The ET trading date the floor was broken, and the breach-basis value and floor at that
+        // moment. Both halves of the pair are kept so "$340 below the floor at the time" survives a
+        // later recovery -- the floor ratchets up, so it cannot be reconstructed after the fact.
+        public DateTime BreachedOn { get; set; }
+        public double   BreachedAt { get; set; }
+        public double   BreachedFloor { get; set; }
+
+        // The ET trading date the daily loss limit was hit, DateTime.MinValue when no day is locked,
+        // and the day's P&L at the moment it bit. Scoped to that day: it clears when the trading date
+        // changes, never when the P&L improves. A soft limit locks the day, never the account.
+        public DateTime DailyLockoutDate { get; set; }
+        public double   DailyLockoutAt { get; set; }
+
+        public LatchedState Copy() { return (LatchedState)MemberwiseClone(); }
+    }
+
     // The computed answer to "am I still passing, and what breaks first?".
     //
     // Everything the window draws comes from here and nowhere else -- the UI never recomputes a rule.
@@ -68,5 +100,20 @@ namespace FundedPath.Engine
 
         // Unverified rules and engine assumptions, for the UI to show as caveats rather than facts.
         public string[] Warnings { get; set; }
+
+        // The latch as it stands AFTER this evaluation -- a copy, never the instance the caller passed
+        // in. Never null. The caller persists this and hands it back on the next call; dropping it on
+        // the floor puts the flash-and-vanish breach straight back.
+        public LatchedState Latched { get; set; }
+
+        // The day's opening balance: the PREVIOUS day's closing balance, not today's first fill. Every
+        // per-day number the window draws hangs off this one, so it is computed once here.
+        public double DayOpenBalance { get; set; }
+
+        // The balance at or below which today breaks the daily loss limit, i.e. DayOpenBalance minus
+        // the limit. 0 when the limit is off, absent, or disarmed above the Initial Trail Balance.
+        // It is a BALANCE line: on the Equity basis an open loser trips the lockout before the balance
+        // curve reaches it, the same gap RoomToFloor already carries.
+        public double DailyLossLimitLevel { get; set; }
     }
 }

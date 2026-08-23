@@ -20,7 +20,7 @@
   <img src="https://img.shields.io/badge/platform-NinjaTrader%208-4A7DFF?style=flat-square" alt="platform: NinjaTrader 8">
   <img src="https://img.shields.io/badge/C%23-7.3-27D67B?style=flat-square" alt="C# 7.3">
   <img src="https://img.shields.io/badge/tests-69%20passing-27D67B?style=flat-square" alt="unit tests">
-  <img src="https://img.shields.io/badge/account-read--only-FF5468?style=flat-square" alt="read-only on the account">
+  <img src="https://img.shields.io/badge/account-read--only%20until%20armed-FF5468?style=flat-square" alt="read-only on the account until you arm enforcement">
   <img src="https://img.shields.io/badge/license-MIT-7A87A2?style=flat-square" alt="MIT license">
 </p>
 
@@ -145,14 +145,28 @@ version as `.bak`.
   than you have — the dangerous direction. Only the day in progress comes from executions;
   everything before it comes from this file. Deleting it is not a harmless reset.
 
-**Never, under any circumstance:** places, modifies or cancels an order. This add-on is **read-only
-on the account**. It has no order-entry surface, no auto-flatten and no kill switch — not a single
-line of it touches NinjaTrader's order-submission API, and `tools/verify-compile.sh` fails the run if
-one ever does: it greps `Engine/` and `NinjaTrader/` for `Submit`, `OrderAction.`, `CreateOrder`,
-`StartAtmStrategy`, `AtmStrategyCreate`, `.Cancel(` and `.Change(`, with line comments stripped first
-so the sentences describing the APIs it refuses to call cannot satisfy their own gate. That audit runs
-*before* the compile, so tripping it fails the run without building anything. If you want something
-that acts on the account, this is not it.
+**Never, under any circumstance:** places, modifies or cancels an order. There is no order-entry
+surface anywhere in this repository.
+
+**It can, if you arm it, close your positions.** That is the one thing it does to an account, it is
+off by default in every new binding, and you turn it on per account in the binding dialog, under a
+control that spells out what it will do before you can choose it. Armed, a latched rule break makes
+it flatten every open position on that account at market and stop the NinjaScript strategies running
+on it — what the firm does to you, done a few seconds earlier and on your own terms. It holds back
+and warns instead whenever this panel is running on data it cannot vouch for: a bindings file that
+failed to load, a missing Eastern time zone, an account in another currency, a non-finite number in
+the day ledger. A tool that flattens on bad data is worse than one that does nothing.
+
+**Every call that touches an account lives in one file**, `NinjaTrader/Enforcer.cs`, and
+`tools/verify-compile.sh` proves it rather than asking you to trust it. Two tiers: order entry
+(`Submit`, `OrderAction.`, `CreateOrder`, `StartAtmStrategy`, `AtmStrategyCreate`, `.Cancel(`,
+`.Change(`) is banned in **every** file including the Enforcer; the account-mutating calls
+(`.Flatten(`, `CancelAllOrders`, `SetState(State.`, plus the account-wide `FlattenEverything`) are
+banned in all eleven other files and allowed only in the Enforcer. Line comments are stripped before
+the grep, so the sentences describing the APIs it refuses to call cannot satisfy their own gate, and
+the audit runs *before* the compile, so tripping it fails the run without building anything. The
+guarantee is not that this code cannot touch your account — it is that you can read everything that
+can, in one file, in one sitting.
 
 ---
 
@@ -254,10 +268,10 @@ Requires NinjaTrader 8. No NuGet packages, no DLLs, no external dependencies —
 
 ```bash
 dotnet test                      # the engine: pure C#, no NinjaTrader, runs anywhere
-tools/verify-compile.sh          # the add-on: read-only audit, then a full-tree compile in the real Custom tree
+tools/verify-compile.sh          # the add-on: account-write audit, then a full-tree compile in the real Custom tree
 ```
 
-`verify-compile.sh` runs two gates: the read-only audit described above, then the compile. The
+`verify-compile.sh` runs two gates: the account-write audit described above, then the compile. The
 compile half exists because `nt8c check <file>` is per-file Roslyn — it cannot see sibling
 files, so it reports cross-file references as errors the NinjaScript Editor compiles fine, and it
 misses name collisions with the ~240 sources NinjaTrader ships under `bin/Custom`. The script stages

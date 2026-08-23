@@ -57,6 +57,16 @@ namespace FundedPath.NT
         static readonly Pen TargetPen = FrozenDash(GreenC, 1.6, 9, 7);                  // dashed green
         static readonly Pen BufferPen = FrozenDash(BlueC, 1.0, 0.5, 2.5);               // thin dotted blue
         static readonly Pen FloorPen  = FrozenDash(RedC, 1.6, 0.5, 2.0, PenLineCap.Round);   // dotted red
+        // The daily loss limit: DASHED red, deliberately the target's own rhythm and thickness in the
+        // other colour, because the two of them are the same KIND of thing - one straight level, fixed
+        // for the whole session, that the day is traded against.
+        //
+        // WHY THE TWO REDS DIFFER: dotted is the account floor, dashed is the daily limit. They are two
+        // different rules with two different costs - the floor ends your ACCOUNT, this one ends your DAY
+        // - so they must never read as the same line drawn twice. The floor also arrives as a smoothed
+        // series with a red wash under it, which is a second, coarser cue at a glance; this one is one
+        // flat rule, so it is drawn flat.
+        static readonly Pen DailyPen  = FrozenDash(RedC, 1.6, 9, 7);                    // dashed red
         static readonly Pen GridPen   = FrozenDash(Color.FromArgb(38, 0xE9, 0xED, 0xF8), 1, 1, 3);
         static readonly Pen CrossPen  = FrozenDash(Color.FromArgb(120, 0x7A, 0x87, 0xA2), 1, 3, 3);
 
@@ -110,7 +120,7 @@ namespace FundedPath.NT
 
         // ---- data (UI-thread confined: only SetSeries/Clear/SetUntracked and OnRender touch it) ----
         private IReadOnlyList<CurvePoint> _pts;
-        private double _target, _buffer;
+        private double _target, _buffer, _dailyLimit;
         private string _targetLabel;
         private bool   _sessionView;
         private bool   _untracked;
@@ -119,12 +129,16 @@ namespace FundedPath.NT
         /// <summary>
         /// Push a new series. The caller hands over a list it will not mutate afterwards (FundedPathTab
         /// rebuilds a fresh one on each 4 Hz paint tick), so this keeps the reference rather than copying.
-        /// target/buffer of 0 mean "this phase has none" and their lines are not drawn.
+        /// target/buffer/dailyLimit of 0 mean "this phase has none" and their lines are not drawn.
+        /// dailyLimit is the LEVEL the daily loss limit sits at - the day's opening balance minus the
+        /// limit - not the limit itself, exactly like target and buffer are levels and not distances.
         /// </summary>
+        // ponytail: dailyLimit is last and defaults to 0 (= not drawn) purely so this file and
+        // FundedPathTab can land in either order without a red tree. The tab always passes it.
         public void SetSeries(IReadOnlyList<CurvePoint> points, double target, double buffer,
-                              string targetLabel, bool sessionView)
+                              string targetLabel, bool sessionView, double dailyLimit = 0.0)
         {
-            _pts = points; _target = target; _buffer = buffer;
+            _pts = points; _target = target; _buffer = buffer; _dailyLimit = dailyLimit;
             _targetLabel = targetLabel; _sessionView = sessionView;
             _untracked = false;
             _ver++;
@@ -135,7 +149,7 @@ namespace FundedPath.NT
         // binding switch, or the old challenge's curve keeps painting under the new account's name.
         public void Clear()
         {
-            _pts = null; _target = 0; _buffer = 0; _targetLabel = null;
+            _pts = null; _target = 0; _buffer = 0; _dailyLimit = 0; _targetLabel = null;
             _untracked = false; _hoverIdx = -1;
             _ver++;
             InvalidateVisual();
@@ -156,12 +170,12 @@ namespace FundedPath.NT
         private double _plotL, _plotR, _plotT, _plotB;
         private double _stepX;
         private double[] _px, _pyBal, _pyFloor;
-        private double _targetY, _bufferY;
-        private bool   _hasTarget, _hasBuffer;
+        private double _targetY, _bufferY, _dailyY;
+        private bool   _hasTarget, _hasBuffer, _hasDaily;
         private Geometry _balFill, _balLine, _floorFill, _floorLine;
         private FormattedText[] _tickFt;
         private double[]        _tickY;
-        private FormattedText   _targetFt;
+        private FormattedText   _targetFt, _dailyFt;
         private FormattedText[] _xFt;
         private double[]        _xFtX;
 
@@ -243,8 +257,9 @@ namespace FundedPath.NT
             if (_balFill   != null) dc.DrawGeometry(GoldWash, null, _balFill);
             if (_floorFill != null) dc.DrawGeometry(RedWash,  null, _floorFill);
 
-            // 3. straight reference lines
+            // 3. straight reference lines. This order is also the readout's row order.
             if (_hasTarget) dc.DrawLine(TargetPen, new Point(_plotL, Snap(_targetY)), new Point(_plotR, Snap(_targetY)));
+            if (_hasDaily)  dc.DrawLine(DailyPen,  new Point(_plotL, Snap(_dailyY)),  new Point(_plotR, Snap(_dailyY)));
             if (_hasBuffer) dc.DrawLine(BufferPen, new Point(_plotL, Snap(_bufferY)), new Point(_plotR, Snap(_bufferY)));
 
             // 4. the two splines. The floor is smoothed exactly like the balance curve because the
@@ -266,6 +281,8 @@ namespace FundedPath.NT
                 dc.DrawText(_tickFt[i], new Point(_plotL - GutterGap - _tickFt[i].Width, _tickY[i] - _tickFt[i].Height / 2.0));
             if (_targetFt != null)
                 dc.DrawText(_targetFt, new Point(_plotL - GutterGap - _targetFt.Width, _targetY - _targetFt.Height / 2.0));
+            if (_dailyFt != null)
+                dc.DrawText(_dailyFt, new Point(_plotL - GutterGap - _dailyFt.Width, _dailyY - _dailyFt.Height / 2.0));
             for (int i = 0; i < _xFt.Length; i++)
                 dc.DrawText(_xFt[i], new Point(_xFtX[i], _plotB + LabelRowGap));
 
@@ -286,6 +303,9 @@ namespace FundedPath.NT
 
             _hasTarget = _target > 0;
             _hasBuffer = _buffer > 0;
+            // Above zero is the switch: the limit is a checkout option, and an account bought without
+            // it hands over a level of 0 and gets no line at all.
+            _hasDaily  = _dailyLimit > 0;
 
             // --- value range: every drawn datum must fit, target and floor included. That is the whole
             //     point of the panel - you read where you are BETWEEN the two lines that end the run.
@@ -300,6 +320,9 @@ namespace FundedPath.NT
             }
             if (_hasTarget) { if (_target < vMin) vMin = _target; if (_target > vMax) vMax = _target; }
             if (_hasBuffer) { if (_buffer < vMin) vMin = _buffer; if (_buffer > vMax) vMax = _buffer; }
+            // Same reason as the floor: a level today is traded against that fell off the bottom of the
+            // panel would be a line the trader cannot see himself approaching.
+            if (_hasDaily)  { if (_dailyLimit < vMin) vMin = _dailyLimit; if (_dailyLimit > vMax) vMax = _dailyLimit; }
 
             double span = vMax - vMin;
             // A flat series (day one, or a single point) has zero span: invent one so nothing divides
@@ -317,10 +340,18 @@ namespace FundedPath.NT
 
             double gutterW = 0;
             _targetFt = null;
+            _dailyFt  = null;
             if (_hasTarget && !string.IsNullOrEmpty(_targetLabel))
             {
                 _targetFt = FT(_targetLabel, AxisSize, GreenBr, dpi, Mono);
                 gutterW = _targetFt.Width;
+            }
+            // Formatted here rather than passed in: Cash() writes the same "#,##0" the tab's Money()
+            // writes for the target label, so one caller-side format string cannot drift from the other.
+            if (_hasDaily)
+            {
+                _dailyFt = FT(Cash(_dailyLimit), AxisSize, RedBr, dpi, Mono);
+                if (_dailyFt.Width > gutterW) gutterW = _dailyFt.Width;
             }
 
             // Plot geometry needs the gutter width, and the collision test below needs the plot
@@ -361,6 +392,7 @@ namespace FundedPath.NT
             }
             _targetY = _plotB - (_target - vBot) / vSpan * ph;
             _bufferY = _plotB - (_buffer - vBot) / vSpan * ph;
+            _dailyY  = _plotB - (_dailyLimit - vBot) / vSpan * ph;
 
             _balLine   = BuildSpline(balPts,   false, 0);
             _floorLine = BuildSpline(floorPts, false, 0);
@@ -377,6 +409,7 @@ namespace FundedPath.NT
                 double y = _plotB - (tickVals[i] - vBot) / vSpan * ph;
                 if (y < _plotT + 2 || y > _plotB - 2) continue;
                 if (_targetFt != null && Math.Abs(y - _targetY) < 13) continue;
+                if (_dailyFt  != null && Math.Abs(y - _dailyY)  < 13) continue;
                 keepFt.Add(ftCand[i]); keepY.Add(y);
             }
             _tickFt = keepFt.ToArray();
@@ -492,10 +525,13 @@ namespace FundedPath.NT
             double cx = Math.Floor(_px[i]) + 0.5;
             dc.DrawLine(CrossPen, new Point(cx, _plotT), new Point(cx, _plotB));
 
-            // A dot on each of the three lines. All three sit on a data point, where the spline passes
-            // exactly through the value - so the dot never lies about where the number came from.
+            // A dot on each line that has a row in the card below, in the same order. All of them sit on
+            // a data point, where the spline passes exactly through the value - so the dot never lies
+            // about where the number came from.
             if (_hasTarget && _targetY >= _plotT && _targetY <= _plotB)
                 dc.DrawEllipse(GreenBr, null, new Point(_px[i], _targetY), 3, 3);
+            if (_hasDaily && _dailyY >= _plotT && _dailyY <= _plotB)
+                dc.DrawEllipse(RedBr, null, new Point(_px[i], _dailyY), 3, 3);
             dc.DrawEllipse(RedBr,  null, new Point(_px[i], _pyFloor[i]), 3, 3);
             dc.DrawEllipse(GoldBr, null, new Point(_px[i], _pyBal[i]),   3.6, 3.6);
 
@@ -563,6 +599,17 @@ namespace FundedPath.NT
             labels.Add("Profit Target");
             values.Add(_hasTarget ? Cash(_target) : "n/a");
             brushes.Add(_hasTarget ? GreenBr : DimBr);
+
+            // Straight fixed levels first, in the order they are drawn, then the per-point numbers.
+            // Unlike the target this row appears only when the rule does: the limit is bought per
+            // account, and a permanent "Daily limit n/a" would be a row of noise on every hover for a
+            // trader who never bought one.
+            if (_hasDaily)
+            {
+                labels.Add("Daily limit");
+                values.Add(Cash(_dailyLimit));
+                brushes.Add(RedBr);
+            }
 
             labels.Add("Balance");
             values.Add(Cash(p.Balance));

@@ -9,6 +9,25 @@ namespace FundedPath.Engine
     // Engine layer: pure C#, no NinjaTrader references. The NT layer hands this file plain strings
     // (Account.Provider.ToString(), Account.Name) so the store can be tested without the platform.
 
+    // What this add-on is allowed to DO to the account when a rule latches, per binding.
+    //
+    // WarnOnly is the default everywhere and is what an old bindings.xml loads as: the element did
+    // not exist before this change, so every binding already on disk comes back with no value, and
+    // the parser's fallback is this first member. An account must never become armed because a file
+    // was written by an older build -- arming is a decision the trader takes once, per account, in
+    // the dialog.
+    public enum EnforcementMode
+    {
+        // Measure and say so. Nothing is ever written to the account. This is what the add-on was
+        // from day one and it stays the default.
+        WarnOnly,
+
+        // Act like the firm does: on a latched breach or daily lockout, close the positions, cancel
+        // the working orders and stop the strategies running on this account. One file does that
+        // (NinjaTrader/Enforcer.cs) and nothing else in this codebase can.
+        Armed
+    }
+
     // One NT8 account mapped to one challenge. Absence of a binding is meaningful: an unbound
     // account is Verdict.Untracked, measured by nothing and recorded nowhere, which is what keeps
     // the trader's own personal live account out of the cockpit by default (spec 2).
@@ -30,6 +49,11 @@ namespace FundedPath.Engine
         // high-water mark: without this the floor restarts from the start balance and reads LOWER
         // than the firm's. Typed, because there is nowhere on the platform to read it from.
         public double      PeakEodCloseSeed   { get; set; }
+        // What the add-on may DO when this account latches a breach or a daily lockout. Defaults to
+        // WarnOnly for a new binding (the enum's first member) and, critically, for every binding
+        // already in an older bindings.xml, which carries no such element at all: the parser falls
+        // back to the same member. Nothing on disk can load as armed unless a human armed it.
+        public EnforcementMode Enforcement    { get; set; }
         public string      Notes              { get; set; }   // free text, the trader's own
 
         // Resolve the catalog row for this binding and apply the trader's own options to a COPY.
@@ -303,6 +327,7 @@ namespace FundedPath.Engine
                 new XElement("StartedUtc", b.StartedUtc.ToString("o", CultureInfo.InvariantCulture)),
                 new XElement("StartBalanceOverride", b.StartBalanceOverride.ToString("R", CultureInfo.InvariantCulture)),
                 new XElement("PeakEodCloseSeed", b.PeakEodCloseSeed.ToString("R", CultureInfo.InvariantCulture)),
+                new XElement("Enforcement", b.Enforcement.ToString()),
                 new XElement("Notes", b.Notes ?? ""));
         }
 
@@ -330,6 +355,11 @@ namespace FundedPath.Engine
             b.StartedUtc         = ParseUtc(Text(e, "StartedUtc"));
             b.StartBalanceOverride = ParseDouble(Text(e, "StartBalanceOverride"));
             b.PeakEodCloseSeed     = ParseDouble(Text(e, "PeakEodCloseSeed"));
+            // FAIL SAFE, not fail same: a missing element, an empty one, a hand-edited typo and a
+            // value written by a future build all land on WarnOnly. This add-on can close positions
+            // and stop strategies; the one direction that must never happen by accident is a file
+            // loading as armed.
+            b.Enforcement        = ParseEnum(Text(e, "Enforcement"), EnforcementMode.WarnOnly);
             b.Notes              = Text(e, "Notes");
             return b;
         }

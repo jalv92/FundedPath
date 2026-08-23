@@ -62,6 +62,8 @@ namespace FundedPath.NT
         private CheckBox     _dll;
         private RadioButton  _basisEquity;
         private RadioButton  _basisBalance;
+        private RadioButton  _enforceWarn;
+        private RadioButton  _enforceAct;
         private DatePicker   _start;
         private TextBox      _override;
         private TextBox      _peak;
@@ -96,7 +98,11 @@ namespace FundedPath.NT
             // NTWindow paints its own chrome from Caption; Window.Title is ignored by it.
             Caption               = "Challenge binding";
             Width                 = 480;
-            Height                = 700;   // two money rows, each with its own explanation line
+            // Two money rows with their own explanation lines, plus the enforcement section - which is
+            // deliberately the tallest thing in the window, because a control that can close positions
+            // has to be read, not skimmed. Fixed height and NoResize, so this number is the only thing
+            // standing between that section and being clipped off the bottom.
+            Height                = 880;
             ResizeMode            = ResizeMode.NoResize;
             ShowInTaskbar         = false;
             WindowStartupLocation = WindowStartupLocation.CenterOwner;
@@ -217,8 +223,8 @@ namespace FundedPath.NT
             _dll.Unchecked += OnLeafChanged;
             AddRow("Daily loss limit", _dll);
 
-            _basisEquity  = MakeRadio("Equity - counts open positions (strict)");
-            _basisBalance = MakeRadio("Balance - realized only");
+            _basisEquity  = MakeRadio("BreachBasis", "Equity - counts open positions (strict)", false);
+            _basisBalance = MakeRadio("BreachBasis", "Balance - realized only", false);
             _basisEquity.IsChecked = true;
             StackPanel basis = new StackPanel { Margin = new Thickness(0, 4, 0, 4) };
             basis.Children.Add(_basisEquity);
@@ -265,6 +271,43 @@ namespace FundedPath.NT
               + "if this challenge starts today. Without it the floor restarts from the start balance "
               + "and reads LOWER than the firm's."));
             AddRow("Peak day close", peak);
+
+            // ---- the only control in this add-on that can act on the account --------------------
+            // Everything above decides what the cockpit MEASURES. This decides what it DOES: on a
+            // broken rule it can flatten the account itself. So it is a labelled section rather than
+            // one more checkbox in a row of settings, the safe option is selected here as the section
+            // is built - so EVERY new binding opens on "Warn me only", whatever was chosen on the last
+            // account - and the dangerous option carries its own bordered card, because a control that
+            // spends real money must not look like the breach-basis radios above it.
+            _enforceWarn = MakeRadio("Enforcement", "Warn me only", false);
+            _enforceAct  = MakeRadio("Enforcement", "Do what the firm does - flatten and stop the strategy", true);
+            _enforceWarn.IsChecked = true;
+            _enforceWarn.Checked += OnLeafChanged;
+            _enforceAct.Checked  += OnLeafChanged;
+
+            StackPanel armed = new StackPanel();
+            armed.Children.Add(_enforceAct);
+            // In the trader's words, not the API's. Every verb here is something he will watch happen
+            // to his own account, so none of them is softened and none of them is left out.
+            armed.Children.Add(Explain(
+                "The moment a rule breaks, this closes every open position on this account at market, "
+              + "cancels the orders working on it, and stops the automated strategies running on it. It "
+              + "cannot be undone - the positions are gone at whatever price the market gave. A bug in "
+              + "this add-on would do exactly the same to an account that was never in trouble.", Red));
+
+            StackPanel enforcement = new StackPanel { Margin = new Thickness(0, 4, 0, 4) };
+            enforcement.Children.Add(_enforceWarn);
+            enforcement.Children.Add(new Border
+            {
+                Background      = Card,
+                BorderBrush     = Red,
+                BorderThickness = new Thickness(1),
+                CornerRadius    = new CornerRadius(4),
+                Padding         = new Thickness(8, 6, 8, 6),
+                Margin          = new Thickness(0, 5, 0, 0),
+                Child           = armed
+            });
+            AddRow("When a rule breaks", enforcement);
 
             PopulateFirms();
             return _form;
@@ -458,6 +501,10 @@ namespace FundedPath.NT
             _peak.IsEnabled     = ok;
             _basisEquity.IsEnabled  = ok;
             _basisBalance.IsEnabled = ok;
+            // Same gate as the rest: a combination the engine cannot measure has no rule to break, so
+            // it must not be armable either.
+            _enforceWarn.IsEnabled  = ok;
+            _enforceAct.IsEnabled   = ok;
             _save.IsEnabled     = ok;
 
             // The toggle switches a rule that exists; a plan with no purchasable DLL has nothing to
@@ -526,13 +573,26 @@ namespace FundedPath.NT
                 floor = "Floor " + Money(preview.SeededFloor) + " on day one; it ratchets on the session "
                       + "close only, and freezes for good at " + Money(preview.FloorLockLevel) + ".";
 
+            // The daily-limit toggle and the enforcement radios are one idea, so the hint says what the
+            // toggle will DRAW and what the radios will DO when the price reaches it. Naming the dash is
+            // the point: on the chart, DASHED red is the day and DOTTED red is the account.
+            string daily = "";
+            if (_dll.IsEnabled && _dll.IsChecked == true && rules.DailyLossLimitWhenOn > 0.0)
+            {
+                daily = " Daily limit ON: the chart draws a red DASHED line at the day's opening balance "
+                      + "minus " + Money(rules.DailyLossLimitWhenOn) + ", in both views. The DOTTED red line is "
+                      + "the account floor - a different rule.";
+                if (_enforceAct.IsChecked == true)
+                    daily += " Armed: touching it flattens this account and stops its strategies.";
+            }
+
             // The unverified phases are exactly the ones a trader binds mid-challenge, so they get
             // the warning AND the floor - returning early here left the funded phase with no
             // feedback at all while he typed the peak close.
             if (!rules.Verified)
-                return "Unverified rules on this phase: the cockpit shows them as warnings, not facts. " + floor;
+                return "Unverified rules on this phase: the cockpit shows them as warnings, not facts. " + floor + daily;
 
-            return floor;
+            return floor + daily;
         }
 
         private void ShowHint(string text, Brush colour)
@@ -556,6 +616,9 @@ namespace FundedPath.NT
                     // basis (spec 1.4): warn earlier, never later.
                     SelectByTag(_firm, Firm.Lucid);
                     _basisEquity.IsChecked = true;
+                    // Warn-only, always, for every new binding. Never carried over from another
+                    // account: arming is a decision made once per account, out loud.
+                    _enforceWarn.IsChecked = true;
                     _start.SelectedDate    = null;
                     _override.Text         = "";
                     _peak.Text             = "";
@@ -566,6 +629,10 @@ namespace FundedPath.NT
                     _dll.IsChecked          = b.DailyLossLimitOn;
                     _basisEquity.IsChecked  = b.BreachBasis == BreachBasis.Equity;
                     _basisBalance.IsChecked = b.BreachBasis == BreachBasis.Balance;
+                    // Both directions explicitly: the two radios share a group, but this dialog is a
+                    // fresh window each time and an unset pair would render as neither chosen.
+                    _enforceAct.IsChecked   = b.Enforcement == EnforcementMode.Armed;
+                    _enforceWarn.IsChecked  = b.Enforcement != EnforcementMode.Armed;
                     // MinValue is the store's "not set", which here means "count every day in the
                     // ledger" - a blank picker, not a date the trader never chose.
                     _start.SelectedDate = b.StartedUtc == DateTime.MinValue
@@ -705,6 +772,12 @@ namespace FundedPath.NT
             b.Size                 = rules.Size;
             b.Phase                = rules.Phase;
             b.DailyLossLimitOn     = _dll.IsEnabled && _dll.IsChecked == true;
+            // IsEnabled-guarded like the toggle above, and for a harder reason: a binding the engine
+            // cannot measure must never be written armed, and a radio the trader could not click is
+            // not consent to touch his account.
+            b.Enforcement          = _enforceAct.IsEnabled && _enforceAct.IsChecked == true
+                                     ? EnforcementMode.Armed
+                                     : EnforcementMode.WarnOnly;
             b.BreachBasis          = _basisBalance.IsChecked == true ? BreachBasis.Balance : BreachBasis.Equity;
             b.StartBalanceOverride = over;
             b.PeakEodCloseSeed     = peak;
@@ -843,15 +916,17 @@ namespace FundedPath.NT
             };
         }
 
-        // The small grey line under a control. Two of them now, and they must not drift apart.
-        private static TextBlock Explain(string text)
+        // The small grey line under a control. Three of them now, and they must not drift apart.
+        // colour is null for the two explanatory ones; the enforcement section passes Red, because
+        // that paragraph is a warning and grey is what the eye skips.
+        private static TextBlock Explain(string text, Brush colour = null)
         {
             return new TextBlock
             {
                 Text         = text,
                 FontFamily   = Sans,
                 FontSize     = 10,
-                Foreground   = Muted,
+                Foreground   = colour ?? Muted,
                 TextWrapping = TextWrapping.Wrap,
                 Margin       = new Thickness(0, 2, 0, 4)
             };
@@ -889,15 +964,19 @@ namespace FundedPath.NT
             };
         }
 
-        private static RadioButton MakeRadio(string label)
+        // One factory for both radio groups. The enforcement group needs its dangerous option to
+        // carry more weight than its safe one - semibold and red against plain text - and that is a
+        // flag rather than a second factory, so the two groups cannot drift apart on font or spacing.
+        private static RadioButton MakeRadio(string group, string label, bool danger)
         {
             return new RadioButton
             {
                 Content    = label,
-                GroupName  = "BreachBasis",
+                GroupName  = group,
                 FontFamily = Sans,
                 FontSize   = 12,
-                Foreground = Text,
+                FontWeight = danger ? FontWeights.SemiBold : FontWeights.Normal,
+                Foreground = danger ? Red : Text,
                 Margin     = new Thickness(0, 2, 0, 2)
             };
         }

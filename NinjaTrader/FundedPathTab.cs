@@ -70,9 +70,42 @@ namespace FundedPath.NT
         // rendering: the rail's "equity basis" caption, the chart's live endpoint and the engine's
         // RoomToFloor must all describe the SAME computation, and _binding can change between them.
         public bool           EquityBasis  { get; set; }
+
+        // The binding revision this frame was computed from. Enforcement is the one decision here that
+        // spends money, and it runs off a frame that was built earlier in the tick - so if Recompute
+        // threw after the triggers advanced, the next tick could pair the OLD binding's frame with the
+        // NEW _binding and act on a rule the trader had just changed. The frame carries the revision so
+        // that pairing can be rejected instead of assumed, the same way EquityBasis is carried above.
+        public int            BindingRev   { get; set; }
         public double         DayOpenBalance { get; set; } // balance at the start of the day in progress
         public int            FillsToday   { get; set; }
         public string[]       Warnings     { get; set; }   // engine warnings + this layer's own
+
+        // The balance at which today's loss reaches the fixed daily loss limit, drawn on the chart as
+        // the level the trader is actually trading against today. 0 = the rule is off, or the scaling
+        // limit has taken over from it and nothing here is watching the day.
+        public double         DailyLimitLevel { get; set; }
+
+        // True when something upstream of the numbers is wrong: an unreadable store, a fallback time
+        // zone, a non-USD account, or a non-finite value in the ledger. The panel still draws - it
+        // just refuses to ACT on a frame carrying this, because a tool that closes positions on bad
+        // data is worse than one that does nothing. DegradedReason says which, in the banner.
+        public bool           Degraded       { get; set; }
+        public string         DegradedReason { get; set; }
+    }
+
+    // One latched rule break, and what this add-on did about it. Persisted in the day ledger so it
+    // survives a restart: that is what stops the panel treating an already-latched breach as a fresh
+    // one and enforcing a second time on an account the trader has already been thrown out of.
+    public sealed class EnforcementRecord
+    {
+        public DateTime AtUtc       { get; set; }   // when the latch tripped
+        public DateTime TradingDate { get; set; }   // the ET trading day it tripped on
+        public string   Kind        { get; set; }   // FundedPathTab.KindBreach / KindDayLock
+        public double   Value       { get; set; }   // breach: room to floor (negative). lockout: day P&L
+        public string   Headline    { get; set; }   // the engine's verdict line at the moment it tripped
+        public string   Action      { get; set; }   // FundedPathTab.Act*
+        public string   Detail      { get; set; }   // the enforcer's transcript, or why it held back
     }
 
     public class FundedPathTab : NTTabPage
@@ -100,6 +133,11 @@ namespace FundedPath.NT
         static readonly Color LiveSimC = Color.FromRgb(0x27, 0xD6, 0x7B);
         static readonly Color LiveC    = Color.FromRgb(0x9B, 0x7B, 0xFF);
         static readonly Color UntrackC = Color.FromRgb(0x4E, 0x5A, 0x74);
+
+        // The latched-state colours, as Colors rather than Brushes: the banner tints its own
+        // background from them at low alpha, which needs the channels.
+        static readonly Color BreachC = Color.FromRgb(0xFF, 0x54, 0x68);   // == Red
+        static readonly Color LockC   = Color.FromRgb(0xF2, 0xB3, 0x3D);   // == Gold
 
         static readonly FontFamily Sans = new FontFamily("Segoe UI");
         static readonly FontFamily Mono = new FontFamily("Consolas");
@@ -175,6 +213,49 @@ namespace FundedPath.NT
         readonly StatCard[] _cards       = new StatCard[5];
         readonly StatCard   _untrackedCard = MakeCard();
         readonly CurveChart _chart       = new CurveChart();
+
+        // The latched-state banner. It spans the whole body, above the rail as well as the chart,
+        // because it is the one thing on this screen that must not be missable.
+        readonly Border    _banner      = new Border();
+        readonly TextBlock _bannerText  = new TextBlock();
+        readonly Button    _bannerReset = new Button();
+        string _bannerFull = "";                // last banner tooltip text; rebuilt only on a change
+
+        // ---- enforcement ----------------------------------------------------------------------------
+        // Loaded from the day ledger when a binding attaches, so a latch survives a restart. That is
+        // what stops a restart being read as a fresh rule break and enforcing all over again.
+        // The engine's latch, which is CALLER-OWNED: Evaluate never mutates the instance it is handed,
+        // it returns an updated copy on ChallengeState.Latched. Dropping it on the floor puts the
+        // flash-and-vanish breach straight back, so it is persisted in the day ledger and handed back
+        // on every call.
+        LatchedState _latched = new LatchedState();
+        List<EnforcementRecord> _enforcements = new List<EnforcementRecord>();
+        EnforcementRecord _enforcingRec;        // the record the confirm loop is chasing, if any
+        int      _enforceBusy;                  // Interlocked 0/1: exactly one enforcement run at a time
+        DateTime _enforceRetryDeadline = DateTime.MinValue;   // platform clock, not the wall clock
+        DateTime _enforceLastAttempt   = DateTime.MinValue;   // platform clock, not the wall clock
+
+        // Replay-clock seconds between confirmation attempts. 2 is house-measured: long enough that a
+        // normal fill lands before a second, over-closing flatten could go out, short enough to re-fire
+        // quickly if the first attempt threw or was momentarily blocked.
+        const int EnforceRetrySeconds   = 2;
+        // How long to keep trying before telling the trader to finish it by hand. Long enough for a slow
+        // broker, short enough that "being handled" never sits on the screen all evening.
+        const int EnforceConfirmSeconds = 60;
+
+        // The two things that latch, and the four things this add-on can have done about one.
+        public const string KindBreach  = "Breached";
+        public const string KindDayLock = "DailyLockout";
+        public const string ActWarn     = "warn-only";
+        public const string ActHeld     = "held-back";
+        public const string ActRunning  = "enforcing";
+        public const string ActDone     = "enforced";
+        // Read back in ActRunning state, i.e. sent to the platform by a run that never reported: the
+        // process was closed, or the account switched, while the flatten was in flight. See
+        // RepairInterruptedEnforcements. It counts as HAVING REACHED the account, so it is never
+        // superseded by a later edge - re-flattening on the strength of "we are not sure" is exactly
+        // the wrong way to resolve the doubt.
+        public const string ActUnknown  = "interrupted";
 
         DispatcherTimer _paintTimer;
         DateTime _lastPaintErr;                 // UI thread only - throttles the paint-tick catch log
@@ -333,6 +414,27 @@ namespace FundedPath.NT
 
             // 3. the body: rail on the right, chart on the left.
             DockPanel body = new DockPanel();
+
+            // The latched-breach banner, added to the body FIRST. A DockPanel gives its children their
+            // slice in the order they were added, so adding it after the rail would leave it starting at
+            // the chart's left edge instead of spanning the body.
+            _bannerText.FontFamily = Sans; _bannerText.FontSize = 12; _bannerText.FontWeight = FontWeights.Bold;
+            _bannerText.TextWrapping = TextWrapping.Wrap;
+            _bannerText.VerticalAlignment = VerticalAlignment.Center;
+            StyleFlatButton(_bannerReset, "RESET BREACH", TextCol);
+            _bannerReset.Margin = new Thickness(12, 0, 0, 0);
+            _bannerReset.VerticalAlignment = VerticalAlignment.Center;
+            _bannerReset.Click += OnResetBreachClick;
+            DockPanel bannerRow = new DockPanel { LastChildFill = true };
+            DockPanel.SetDock(_bannerReset, Dock.Right);
+            bannerRow.Children.Add(_bannerReset);      // docked child first, wrapping text fills the rest
+            bannerRow.Children.Add(_bannerText);
+            _banner.Child = bannerRow;
+            _banner.BorderThickness = new Thickness(0, 0, 0, 1);
+            _banner.Padding = new Thickness(14, 9, 14, 9);
+            _banner.Visibility = Visibility.Collapsed;
+            DockPanel.SetDock(_banner, Dock.Top);
+            body.Children.Add(_banner);
 
             // The rail lives in a ScrollViewer: the five cards are Auto-height and grow with their strings,
             // so a short window must scroll them, not clip the bottom one.
@@ -701,6 +803,12 @@ namespace FundedPath.NT
                     Render(f);
                     PushToChart(f);                  // SetSeries/SetUntracked each call InvalidateVisual themselves
                 }
+
+                // OUTSIDE the change gate, deliberately. The latch EDGE is read off the current frame,
+                // but the "did the flatten actually take" follow-up has to keep running on ticks where
+                // nothing changed - a flatten that was blocked moves no number on this screen at all.
+                CockpitFrame current = _frame;
+                if (current != null) MaybeEnforce(current, platformNow);
             }
             catch (Exception ex)
             {
@@ -730,6 +838,9 @@ namespace FundedPath.NT
             if (!string.IsNullOrEmpty(_etWarning)) extraWarnings.Add(_etWarning);
 
             Derived d = new Derived();
+            // Tracked separately from the warning text: this one gates ACTING on the account, and a
+            // warning string is not a flag.
+            bool denomMismatch = false;
             // The binding check comes FIRST. BuildFromExecutions scans Account.Executions, runs
             // SystemPerformance.Calculate over every one of them and prints the commission reconcile to the
             // Output tab; the denomination probe below is another read. None of that may touch an account
@@ -755,8 +866,11 @@ namespace FundedPath.NT
                 try
                 {
                     if (acct.Denomination != Currency.UsDollar)
+                    {
+                        denomMismatch = true;
                         extraWarnings.Add("This account is denominated in " + acct.Denomination +
                                           ", but the rulebook is in US dollars. The figures below are not comparable.");
+                    }
                 }
                 catch { /* mid-connect: re-checked on the next recompute */ }
             }
@@ -768,7 +882,12 @@ namespace FundedPath.NT
             if (rules != null && _ledger != null)
                 completed = MergeLedger(d.Completed, today);
 
-            ChallengeState state = ChallengeEngine.Evaluate(rules, completed, d.OpenRealized, s.Unrealized, basis);
+            // The latch and the trading date are the memory this pure function cannot hold. It hands
+            // back the updated latch on the state; keeping it is what makes a breach survive the tick,
+            // and persisting it is what makes it survive the restart.
+            ChallengeState state = ChallengeEngine.Evaluate(rules, completed, d.OpenRealized, s.Unrealized,
+                                                            basis, _latched, today);
+            _latched = state.Latched;
 
             CockpitPhase phase = PhaseOf(acct, binding, rules);
             CockpitFrame f = new CockpitFrame();
@@ -784,14 +903,40 @@ namespace FundedPath.NT
             f.LiveBalance = state.Balance;
             f.LiveEquity = state.Equity;
             f.EquityBasis = basis == BreachBasis.Equity;
-            f.DayOpenBalance = state.Balance - d.OpenRealized;
+            f.BindingRev  = _bindingRev;      // see CockpitFrame.BindingRev: enforcement refuses a stale pairing
+            // Both off the engine now that it exposes them. They used to be recomputed here, and a
+            // second definition of the daily-limit LEVEL is exactly the kind of duplicate that drifts
+            // until the red line on the chart and the number on the card disagree.
+            f.DayOpenBalance = state.DayOpenBalance;
             f.FillsToday = d.OpenFills;
+            f.DailyLimitLevel = state.DailyLossLimitLevel;
+
+            // THE GATE ON ACTING. Every branch below is a reason to distrust the numbers above, and the
+            // enforcement path refuses to touch the account while one holds. Ordered by cause: a store
+            // that failed to load is usually WHY the rest is wrong, so it is named first.
+            if (!string.IsNullOrEmpty(_storeError))
+                f.DegradedReason = "the bindings or the day ledger could not be read or written (" + _storeError + ")";
+            else if (!string.IsNullOrEmpty(_etWarning))
+                f.DegradedReason = "the Eastern time zone is a fallback, so trading days may be bucketed into the wrong session (" + _etWarning + ")";
+            else if (denomMismatch)
+                f.DegradedReason = "this account is not denominated in US dollars, so its figures are not comparable with the rulebook";
+            else if (AnyNonFinite(state, completed, s.Unrealized))
+                f.DegradedReason = "a non-finite value (NaN or infinity) is present in the day ledger or in the computed state";
+            f.Degraded = f.DegradedReason != null;
 
             // Untracked: the engine's own two warnings ("No challenge is bound...", "<plan> is not
             // modelled yet") say in a bullet exactly what the untracked card says in a sentence, one
             // directly under the other. THIS layer's warnings survive - an unreadable bindings file is
             // usually WHY an account reads untracked, and that bullet is the only thing that says so.
-            List<string> all = new List<string>(extraWarnings);
+            List<string> all = new List<string>();
+            // FIRST, above everything, and only when it is actually true: an account the trader armed
+            // and believes is being policed, that is in fact not being policed. The banner cannot say
+            // this - it only appears once something has already latched, and by then it is too late to
+            // go and fix a time zone.
+            if (f.Degraded && binding != null && binding.Enforcement == EnforcementMode.Armed)
+                all.Add("Enforcement is ARMED for this account but is BLOCKED right now: " + f.DegradedReason +
+                        ". Nothing will be closed automatically until that is fixed.");
+            all.AddRange(extraWarnings);
             if (rules != null && state.Warnings != null) all.AddRange(state.Warnings);
             f.Warnings = all.ToArray();
             return f;
@@ -983,6 +1128,44 @@ namespace FundedPath.NT
                 dirty = true;                         // and the file is rewritten below, so it matches what is shown
             }
 
+            // The same repair for the latch records: a breach the trader rewound away must not keep the
+            // banner up over a run that no longer exists. STRICTLY after today - a record dated today is
+            // the day in progress, which is precisely what the banner is for.
+            for (int i = _enforcements.Count - 1; i >= 0; i--)
+                if (_enforcements[i] != null && _enforcements[i].TradingDate > today)
+                {
+                    _enforcements.RemoveAt(i);
+                    dirty = true;
+                }
+
+            // ...and the ENGINE's latch with them. Purging only the records left the two halves out of
+            // step: the latch still said Breached, the record that proved it had been rewound away, so the
+            // edge test saw a fresh breach and, on an armed account, flattened a second time - on a run
+            // that no longer exists. A Playback account can be armed (arming is gated on the rulebook,
+            // not the provider), and Market Replay is exactly where this add-on gets rehearsed, so this
+            // was live rather than theoretical. Same shape on a live account via a backwards clock step
+            // across a day boundary.
+            //
+            // The latch is only ever cleared here for a breach the rewind actually undid: dated strictly
+            // after today, on the same test the records use.
+            if (_latched != null && _latched.ChallengeBreached && _latched.BreachedOn > today)
+            {
+                _latched.ChallengeBreached = false;
+                _latched.BreachedOn        = DateTime.MinValue;
+                _latched.BreachedAt        = 0.0;
+                _latched.BreachedFloor     = 0.0;
+                dirty = true;
+                NinjaTrader.Code.Output.Process(
+                    "[FundedPath] replay rewound past the breach - the challenge latch is cleared with it.",
+                    NinjaTrader.NinjaScript.PrintTo.OutputTab1);
+            }
+            if (_latched != null && _latched.DailyLockoutDate > today)
+            {
+                _latched.DailyLockoutDate = DateTime.MinValue;
+                _latched.DailyLockoutAt   = 0.0;
+                dirty = true;
+            }
+
             // Computed rows win over stored ones for the days they cover: they are re-derived from the live
             // execution list, so they carry broker amendments and a Playback rewind's corrected history.
             // Days the executions no longer reach keep whatever the ledger holds.
@@ -1031,6 +1214,12 @@ namespace FundedPath.NT
             _ledger = null;
             _ledgerPath = null;
             _bindingRev++;
+            // The latch records belong to the account that is going away. Cleared before the new one's
+            // are loaded, or the previous challenge's breach banner would sit over this account.
+            _enforcements.Clear();
+            _enforcingRec = null;
+            _enforceRetryDeadline = DateTime.MinValue;
+            _latched = new LatchedState();
             // Re-seed from the store rather than keeping the last message: a ledger error the trader has
             // since repaired must stop being reported, or the rail cries wolf for the rest of the session.
             _storeError = _store.LastLoadError;
@@ -1049,13 +1238,43 @@ namespace FundedPath.NT
             string dir = Path.GetDirectoryName(_bindingsPath);
             _ledgerPath = Path.Combine(dir ?? "", "days-" + SafeFileName(key) + ".xml");
             bool failed;
-            _ledger = LoadLedger(_ledgerPath, out failed);   // the failure is already on _storeError
+            _ledger = LoadLedger(_ledgerPath, out failed, _enforcements);   // the failure is already on _storeError
+            _latched = LoadLatch(_ledgerPath);
+            RepairInterruptedEnforcements();
+        }
+
+        // A record is written as "enforcing" BEFORE anything is sent to the platform - deliberately, so a
+        // crash between the two leaves evidence rather than silence. The cost is that any record still in
+        // that state when it is READ BACK belongs to a run that never reported: NinjaTrader was closed
+        // mid-flatten, the account was switched while the platform was working, or the enforcer's thread
+        // died. Left alone it renders as "enforcing..." for ever, which reads as an action still in
+        // flight and is the one thing a banner must never lie about.
+        //
+        // It is NOT downgraded to a failure: the flatten may well have gone through. It is marked
+        // unfinished, which is the only thing that is actually known, and it points at the one place the
+        // truth exists.
+        void RepairInterruptedEnforcements()
+        {
+            for (int i = 0; i < _enforcements.Count; i++)
+            {
+                EnforcementRecord r = _enforcements[i];
+                if (r == null || r.Action != ActRunning) continue;
+                r.Action = ActUnknown;
+                r.Detail = "INTERRUPTED. Enforcement was sent to the platform at " + EtStamp(r.AtUtc) +
+                           " and this panel never saw it finish - NinjaTrader closed, or the account was " +
+                           "switched, while it was working. It may well have gone through. Check the " +
+                           "account and the Output tab, then close it by hand if anything is still open.";
+            }
         }
 
         // failed means the file exists and could not be READ. That is NOT the same as "came up empty":
         // a missing file is the normal first day of a challenge. SaveLedger's read-modify-write turns on
         // exactly that difference - merging into a dictionary that only LOOKS empty replaces the file.
-        Dictionary<DateTime, TradingDay> LoadLedger(string path, out bool failed)
+        // intoEnforcements is filled with the latch records in the same file when it is non-null. They
+        // live in the day ledger rather than a file of their own because they are the same kind of fact
+        // as a completed day - something that happened to this account, that must survive a restart, and
+        // that only means anything next to the days around it.
+        Dictionary<DateTime, TradingDay> LoadLedger(string path, out bool failed, List<EnforcementRecord> intoEnforcements)
         {
             failed = false;
             Dictionary<DateTime, TradingDay> rows = new Dictionary<DateTime, TradingDay>();
@@ -1078,6 +1297,15 @@ namespace FundedPath.NT
                     row.RealizedPnL = p;
                     row.Fills = n;
                     rows[row.Date] = row;
+                }
+
+                if (intoEnforcements != null)
+                {
+                    foreach (XElement e in doc.Root.Elements("Enforcement"))
+                    {
+                        EnforcementRecord rec = ReadEnforcement(e);
+                        if (rec != null) intoEnforcements.Add(rec);
+                    }
                 }
             }
             catch (Exception ex)
@@ -1104,7 +1332,8 @@ namespace FundedPath.NT
             // MORE room than the trader has - the dangerous direction. Our rows win on the days we cover:
             // they were just re-derived from the live execution list.
             bool failed;
-            Dictionary<DateTime, TradingDay> merged = LoadLedger(_ledgerPath, out failed);
+            List<EnforcementRecord> mergedEnf = new List<EnforcementRecord>();
+            Dictionary<DateTime, TradingDay> merged = LoadLedger(_ledgerPath, out failed, mergedEnf);
 
             // FAIL CLOSED, exactly as OnConfigureClick refuses to swap in a BindingStore that failed to
             // load. LoadLedger swallows every exception and hands back an empty dictionary, so without
@@ -1129,6 +1358,33 @@ namespace FundedPath.NT
 
             _ledger = merged;
 
+            // Same read-modify-write for the latch records, and for the same reason: a second tab on
+            // this account key rewrites this file whole, and losing the record that a breach was already
+            // enforced is what would let a restart enforce it a second time. Keyed on the instant plus
+            // the kind, so our own copy of a record replaces the file's rather than duplicating it.
+            List<EnforcementRecord> outEnf = new List<EnforcementRecord>();
+            List<string> enfSeen = new List<string>();
+            for (int i = 0; i < _enforcements.Count; i++)
+            {
+                EnforcementRecord rec = _enforcements[i];
+                if (rec == null || rec.TradingDate > today) continue;
+                string k = rec.AtUtc.Ticks.ToString(CultureInfo.InvariantCulture) + "|" + (rec.Kind ?? "");
+                if (enfSeen.Contains(k)) continue;
+                enfSeen.Add(k);
+                outEnf.Add(rec);
+            }
+            for (int i = 0; i < mergedEnf.Count; i++)
+            {
+                EnforcementRecord rec = mergedEnf[i];
+                if (rec == null || rec.TradingDate > today) continue;
+                string k = rec.AtUtc.Ticks.ToString(CultureInfo.InvariantCulture) + "|" + (rec.Kind ?? "");
+                if (enfSeen.Contains(k)) continue;
+                enfSeen.Add(k);
+                outEnf.Add(rec);
+            }
+            outEnf.Sort(delegate (EnforcementRecord a, EnforcementRecord b) { return a.AtUtc.CompareTo(b.AtUtc); });
+            _enforcements = outEnf;
+
             XElement root = new XElement("FundedPathDays", new XAttribute("version", "1"));
             List<TradingDay> rows = new List<TradingDay>(_ledger.Values);
             rows.Sort(delegate (TradingDay a, TradingDay b) { return a.Date.CompareTo(b.Date); });
@@ -1140,6 +1396,34 @@ namespace FundedPath.NT
                     new XAttribute("date", rows[i].Date.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture)),
                     new XAttribute("pnl", rows[i].RealizedPnL.ToString("R", CultureInfo.InvariantCulture)),
                     new XAttribute("fills", rows[i].Fills.ToString(CultureInfo.InvariantCulture))));
+            }
+
+            // LAST WRITER WINS, deliberately. A second tab on the same account key holds its own latch
+            // and would need a merge, but a merge that adopts the file's breach would resurrect one the
+            // trader has just reset. The enforcement RECORDS are merged (above), and those are what stop
+            // an account being closed twice - so the worst a stale second tab costs is a headline.
+            if (_latched != null)
+                root.Add(new XElement("Latch",
+                    new XAttribute("breached", _latched.ChallengeBreached ? "true" : "false"),
+                    new XAttribute("on", Ymd(_latched.BreachedOn)),
+                    new XAttribute("at", _latched.BreachedAt.ToString("R", CultureInfo.InvariantCulture)),
+                    new XAttribute("floor", _latched.BreachedFloor.ToString("R", CultureInfo.InvariantCulture)),
+                    new XAttribute("lockDate", Ymd(_latched.DailyLockoutDate)),
+                    new XAttribute("lockAt", _latched.DailyLockoutAt.ToString("R", CultureInfo.InvariantCulture))));
+
+            for (int i = 0; i < _enforcements.Count; i++)
+            {
+                EnforcementRecord rec = _enforcements[i];
+                root.Add(new XElement("Enforcement",
+                    // Round-trip "o" on a UTC instant: this stamp is compared against records written by
+                    // another machine in another zone, and a local-time stamp would reorder them.
+                    new XAttribute("at", rec.AtUtc.ToString("o", CultureInfo.InvariantCulture)),
+                    new XAttribute("date", rec.TradingDate.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture)),
+                    new XAttribute("kind", rec.Kind ?? ""),
+                    new XAttribute("value", rec.Value.ToString("R", CultureInfo.InvariantCulture)),
+                    new XAttribute("action", rec.Action ?? ""),
+                    new XAttribute("headline", rec.Headline ?? ""),
+                    rec.Detail ?? ""));   // the enforcer's transcript, verbatim
             }
 
             // Temp-then-swap, same discipline as BindingStore.Save: a crash mid-write leaves the old file
@@ -1284,10 +1568,29 @@ namespace FundedPath.NT
                           f.TradingDate.ToString("MMM d", CultureInfo.InvariantCulture) +
                           (f.Tracked ? Dot + SourceLabel(f.Phase) : "");
 
-            _verdictText.Text = string.IsNullOrEmpty(st.Headline) ? "UNTRACKED" : st.Headline;
-            Brush vb = VerdictBrush(st.Verdict);
-            _verdictText.Foreground = vb;
-            _verdictPill.BorderBrush = vb;
+            // A LATCH OUTRANKS THE LIVE VERDICT, and that is the whole point. He hit his daily limit,
+            // the pill flashed, and it was back to ON TRACK before he looked up - the worst moment of
+            // his day left no mark on the screen at all. A latched state now stays: until the day rolls
+            // for a soft daily lockout, until he resets it for a challenge breach.
+            EnforcementRecord latch = ActiveLatch(f.TradingDate);
+            if (latch != null)
+            {
+                bool isBreach = latch.Kind == KindBreach;
+                _verdictText.Text = isBreach
+                    ? "BREACHED" + Dot + Money(Math.Max(0.0, -latch.Value)) + " BELOW THE FLOOR"
+                    : "DAY LOCKED" + Dot + "DONE FOR TODAY";
+                Brush lb = isBreach ? Red : Gold;
+                _verdictText.Foreground = lb;
+                _verdictPill.BorderBrush = lb;
+            }
+            else
+            {
+                _verdictText.Text = string.IsNullOrEmpty(st.Headline) ? "UNTRACKED" : st.Headline;
+                Brush vb = VerdictBrush(st.Verdict);
+                _verdictText.Foreground = vb;
+                _verdictPill.BorderBrush = vb;
+            }
+            RenderBanner(f);
 
             // Untracked: the chart is greyed here, on the host, so the state is visibly correct even before
             // CurveChart draws its own "no challenge bound" message from frame.Tracked.
@@ -1507,7 +1810,10 @@ namespace FundedPath.NT
                 pts.Add(live);
             }
 
-            _chart.SetSeries(pts, target, buffer, target > 0 ? Money(target) : null, f.SessionView);
+            // The daily-limit LEVEL, not the limit itself, exactly like target and buffer are levels.
+            // 0 means the rule is off or disarmed above the Initial Trail Balance, and the chart draws
+            // no line for it.
+            _chart.SetSeries(pts, target, buffer, target > 0 ? Money(target) : null, f.SessionView, f.DailyLimitLevel);
         }
 
         // MIRRORS ChallengeEngine's goal selection exactly (its "goal and days" block). Duplicated rather
@@ -1579,7 +1885,491 @@ namespace FundedPath.NT
             }
         }
 
+        // ---- enforcement ----------------------------------------------------------------------------
+        //
+        // Until this change the add-on could not reach the account BY CONSTRUCTION. It now acts the way
+        // the firm does: when a rule LATCHES it closes the positions, cancels the working orders and
+        // stops the strategies on that account. Everything that touches the platform lives in
+        // Enforcer.cs; what lives here is the DECISION, which is the half with all the ways to be wrong:
+        //
+        //   * only on an account that carries a binding, and only when THAT binding is armed. Every
+        //     binding is warn-only until a human arms it, including every binding already on disk.
+        //   * only on the EDGE - the tick a latch goes from not-set to set. A latch already recorded,
+        //     including one read back from the ledger after a restart, never fires again. A restart
+        //     must not close a position the trader has since deliberately reopened.
+        //   * never on a degraded frame. A store error, a fallback time zone, a non-USD account or a
+        //     non-finite number in the ledger all mean the figures under the verdict cannot be trusted,
+        //     and a tool that closes positions on bad data is worse than one that does nothing. It says
+        //     so in the banner and in the log, and it does not act.
+        //   * the record is written to the ledger BEFORE the platform is touched, so a crash between the
+        //     two leaves a latch that is already recorded rather than one that fires again on the next
+        //     start.
+        //   * Enforcer.Enforce runs on a THREAD-POOL thread, never on this window's dispatcher:
+        //     SetState(State.Terminated) runs the target strategy's OnStateChange synchronously on the
+        //     calling thread, and that is third-party code that may block for as long as it likes.
+        void MaybeEnforce(CockpitFrame f, DateTime platformNow)
+        {
+            ConfirmEnforcement(f, platformNow);
+
+            string kind = f.State.Verdict == Verdict.Breached     ? KindBreach
+                        : f.State.Verdict == Verdict.DailyLockout ? KindDayLock
+                        : null;
+            if (kind == null) return;
+            EnforcementRecord prior = FindLatch(kind, f.TradingDate);
+            if (!CanSupersede(prior)) return;   // already latched and already handled as well as it can be
+            OnLatchEdge(f, kind, platformNow, prior);
+        }
+
+        // Whether a latch that is ALREADY recorded may be acted on again.
+        //
+        // The dedupe used to be "a record exists, therefore we are done", and that silently burned the
+        // one chance an armed account gets. A challenge breach is terminal and fires ONCE: if it landed
+        // during a single tick of degraded data, or while the binding was still warn-only, the held-back
+        // record blocked every later attempt - that session and, because the record is persisted, every
+        // session after it. The comment in the held-back message promises it "will act on the next rule
+        // break"; for a once-only breach there is no next one.
+        //
+        // So: a record that actually reached the platform is final. One that did not is a placeholder
+        // that a change in circumstances is allowed to supersede - and only a change that would produce
+        // a DIFFERENT outcome, so warn-only does not re-fire itself four times a second.
+        bool CanSupersede(EnforcementRecord prior)
+        {
+            if (prior == null) return true;                       // a fresh edge
+            if (prior.Action == ActRunning || prior.Action == ActDone || prior.Action == ActUnknown)
+                return false;   // it reached the platform, or may have; never send a second one
+            CockpitFrame f = _frame;
+            if (f == null) return false;
+            if (!ArmedFor(f)) return false;                       // still warn-only: nothing has changed
+            if (prior.Action == ActHeld && f.Degraded) return false;  // still cannot vouch for the data
+            return true;                                          // armed now, and able to act
+        }
+
+        // One definition of "armed", used by the edge test and by the action that follows it, so the two
+        // can never disagree about whether this account is allowed to be touched.
+        bool ArmedFor(CockpitFrame f)
+        {
+            AccountBinding b = _binding;
+            if (f == null || !f.Tracked || _account == null || b == null) return false;
+            // A frame from a previous binding must never authorise an action under the current one. This
+            // costs nothing in the normal case - Recompute rebuilds the frame in the same tick that
+            // bumps the revision - and it closes the window where Recompute threw AFTER the triggers
+            // advanced, leaving last binding's frame paired with this binding's account.
+            if (f.BindingRev != _bindingRev) return false;
+            return b.Enforcement == EnforcementMode.Armed;
+        }
+
+        // `prior` is a placeholder record this edge is superseding (warn-only, or held back on degraded
+        // data) - see CanSupersede. It is UPDATED IN PLACE rather than joined by a second record, so the
+        // ledger keeps one row per latch and the banner cannot show the same breach twice.
+        void OnLatchEdge(CockpitFrame f, string kind, DateTime platformNow, EnforcementRecord prior)
+        {
+            EnforcementRecord rec = prior != null ? prior : new EnforcementRecord();
+            rec.AtUtc       = DateTime.UtcNow;
+            rec.TradingDate = f.TradingDate;
+            rec.Kind        = kind;
+            // The number the trader will want tomorrow: how far under the floor he went, or what the day
+            // actually cost him. Taken at the instant it tripped, never recomputed afterwards.
+            rec.Value       = kind == KindBreach ? f.State.RoomToFloor : f.State.DayPnL;
+            rec.Headline    = f.State.Headline;
+
+            AccountBinding b = _binding;
+            Account acct = _account;
+            bool armed = f.Tracked && acct != null && b != null && b.Enforcement == EnforcementMode.Armed;
+
+            if (!armed)
+            {
+                rec.Action = ActWarn;
+                rec.Detail = "Enforcement is set to WARN ONLY for this account, so nothing was sent to the platform. " +
+                             "Close your position and stop your strategies yourself.";
+            }
+            else if (f.Degraded)
+            {
+                rec.Action = ActHeld;
+                rec.Detail = "HELD BACK. Enforcement is armed for this account, but this panel is running on data it " +
+                             "cannot vouch for: " + (f.DegradedReason ?? "unknown") + ". Nothing was sent to the platform. " +
+                             "Close the account by hand, fix what is named here, and it will act on the next rule break.";
+                NinjaTrader.Code.Output.Process("[FundedPath] ENFORCEMENT HELD BACK - " + rec.Detail,
+                    NinjaTrader.NinjaScript.PrintTo.OutputTab1);
+            }
+            else
+            {
+                rec.Action = ActRunning;
+                rec.Detail = "Enforcement started at " + EtStamp(rec.AtUtc) + ". Waiting for the platform.";
+            }
+
+            if (prior == null) _enforcements.Add(rec);   // superseding one: it is already in the list
+            PersistEnforcement(f.TradingDate);          // on disk BEFORE anything reaches the account
+
+            if (rec.Action == ActRunning)
+            {
+                _enforcingRec = rec;
+                _enforceRetryDeadline = platformNow.AddSeconds(EnforceConfirmSeconds);
+                RunEnforcer(acct, rec, rec.Headline + " (" + kind + ")", platformNow);
+            }
+
+            RenderBanner(f);
+        }
+
+        // The "keep it flat" follow-up. Account.Flatten is fire and forget - it returns before the fills
+        // land - and a flatten that was momentarily blocked changes nothing on screen, so the only honest
+        // way to know it took is to re-read the account. This latches on CONFIRMED flat, never on
+        // attempted: the house learned that the expensive way, when a blocked flatten burned a
+        // once-per-day latch and the open position was never retried.
+        void ConfirmEnforcement(CockpitFrame f, DateTime platformNow)
+        {
+            if (_enforceRetryDeadline == DateTime.MinValue) return;
+
+            Account acct = _account;
+            string detail;
+            if (acct == null || Enforcer.IsQuiet(acct, out detail))
+            {
+                _enforceRetryDeadline = DateTime.MinValue;
+                if (_enforcingRec != null)
+                {
+                    _enforcingRec.Detail += "\nCONFIRMED at " + EtStamp(DateTime.UtcNow) +
+                                            ": no open position and no working order remain.";
+                    PersistEnforcement(f.TradingDate);
+                    RenderBanner(f);
+                }
+                return;
+            }
+
+            // Both clocks here are the PLATFORM clock, so a replay running at 24x retries at 24x too.
+            // A rewind moves it backwards and stalls this window until the account reads quiet - which a
+            // rewind makes true anyway, because it wipes the positions.
+            if (platformNow >= _enforceRetryDeadline)
+            {
+                _enforceRetryDeadline = DateTime.MinValue;
+                if (_enforcingRec != null)
+                {
+                    _enforcingRec.Detail += "\nGAVE UP CONFIRMING after " + EnforceConfirmSeconds + "s - " + detail +
+                                            ". CLOSE IT BY HAND.";
+                    PersistEnforcement(f.TradingDate);
+                    RenderBanner(f);
+                }
+                NinjaTrader.Code.Output.Process(
+                    "[FundedPath] enforcement could not be confirmed flat: " + detail + " - CLOSE IT BY HAND.",
+                    NinjaTrader.NinjaScript.PrintTo.OutputTab1);
+                return;
+            }
+
+            if ((platformNow - _enforceLastAttempt).TotalSeconds >= EnforceRetrySeconds)
+                RunEnforcer(acct, _enforcingRec, "still not flat after the enforcement above", platformNow);
+        }
+
+        void RunEnforcer(Account acct, EnforcementRecord rec, string reason, DateTime platformNow)
+        {
+            if (acct == null || rec == null) return;
+
+            // Exactly one run at a time. Two overlapping sweeps would fight over the same position, and
+            // the second can go out AFTER the first one's fill - which is how a flat account ends up
+            // short. Interlocked rather than a lock: this is read from the UI thread and released from a
+            // thread-pool one.
+            if (System.Threading.Interlocked.CompareExchange(ref _enforceBusy, 1, 0) != 0) return;
+            _enforceLastAttempt = platformNow;
+
+            System.Threading.ThreadPool.QueueUserWorkItem(delegate
+            {
+                string transcript;
+                try { transcript = Enforcer.Enforce(acct, reason); }
+                catch (Exception ex)
+                {
+                    // Enforce is written never to throw. If it ever does, that is the single most
+                    // important line in the log, not a swallowed exception on a background thread.
+                    transcript = "THE ENFORCER ITSELF FAILED: " + ex.Message + " - CHECK THE ACCOUNT BY HAND.";
+                }
+                finally { System.Threading.Interlocked.Exchange(ref _enforceBusy, 0); }
+
+                try
+                {
+                    Dispatcher.InvokeAsync((Action)delegate
+                    {
+                        if (_dead) return;             // the tab was closed while the platform was working
+                        rec.Action = ActDone;
+                        rec.Detail = transcript;
+                        CockpitFrame cur = _frame;
+                        PersistEnforcement(cur != null ? cur.TradingDate : _lastTradingDate);
+                        if (cur != null) RenderBanner(cur);
+                    });
+                }
+                catch { /* the window's dispatcher is gone; the transcript is already in the Output tab */ }
+            });
+        }
+
+        // A challenge breach is latched for the whole challenge - it is what the firm recorded, and no
+        // new day undoes it. A daily lockout belongs to ONE trading day and is gone when the day rolls,
+        // which is what the rule itself does.
+        EnforcementRecord FindLatch(string kind, DateTime today)
+        {
+            for (int i = _enforcements.Count - 1; i >= 0; i--)
+            {
+                EnforcementRecord r = _enforcements[i];
+                if (r == null || r.Kind != kind) continue;
+                if (kind == KindBreach || r.TradingDate == today) return r;
+            }
+            return null;
+        }
+
+        // What the pill and the banner show. A breach outranks a lockout: an account that is out is out,
+        // whatever today's P&L happens to be doing.
+        EnforcementRecord ActiveLatch(DateTime today)
+        {
+            EnforcementRecord breach = FindLatch(KindBreach, today);
+            return breach != null ? breach : FindLatch(KindDayLock, today);
+        }
+
+        void PersistEnforcement(DateTime today)
+        {
+            if (_ledgerPath == null || _ledger == null) return;
+            try { SaveLedger(today); }
+            catch (Exception ex)
+            {
+                // Not fatal to the session - the latch is held in memory, so nothing enforces twice
+                // before the next restart - but it must be said out loud, because after a restart it
+                // could. It also degrades the frame, which blocks any further enforcement until fixed.
+                _storeError = "Could not write the enforcement record to the day ledger: " + ex.Message;
+                NinjaTrader.Code.Output.Process("[FundedPath] enforcement record not saved: " + ex,
+                    NinjaTrader.NinjaScript.PrintTo.OutputTab1);
+            }
+        }
+
+        // The thing he said was missing. He hit his daily limit, the window flashed a message and went
+        // back to ON TRACK, and the record of the worst moment of his day was gone before he looked up.
+        // This carries what happened, when, at what value, and what this add-on did about it - and it
+        // stays until the day rolls or he resets it.
+        void RenderBanner(CockpitFrame f)
+        {
+            EnforcementRecord rec = f == null ? null : ActiveLatch(f.TradingDate);
+            if (rec == null)
+            {
+                _banner.Visibility = Visibility.Collapsed;
+                _bannerReset.Visibility = Visibility.Collapsed;
+                _bannerFull = "";
+                return;
+            }
+
+            bool breach = rec.Kind == KindBreach;
+            Color c = breach ? BreachC : LockC;
+            // Per-frame and unfrozen, like the phase brush: this repaints only when something latched or
+            // the transcript arrived, not at 4 Hz.
+            _banner.Background  = new SolidColorBrush(Color.FromArgb(30, c.R, c.G, c.B));
+            _banner.BorderBrush = new SolidColorBrush(Color.FromArgb(140, c.R, c.G, c.B));
+            _bannerText.Foreground = new SolidColorBrush(c);
+
+            string what = breach
+                ? "BREACHED" + Dot + Money(Math.Max(0.0, -rec.Value)) + " below the floor"
+                : "DAY LOCKED" + Dot + Signed(rec.Value) + " on the day";
+
+            _bannerText.Text = what + Dot + EtStamp(rec.AtUtc) + Dot + ActionLine(rec);
+            _banner.Visibility = Visibility.Visible;
+            // Only a challenge breach can be reset. A daily lockout clears itself when the day rolls,
+            // exactly as the rule does, so a button for it would be a button that lies.
+            _bannerReset.Visibility = breach ? Visibility.Visible : Visibility.Collapsed;
+
+            string full = what + "\n" + EtStamp(rec.AtUtc) + " - " + (rec.Headline ?? "") + "\n\n" + (rec.Detail ?? "");
+            if (full != _bannerFull)
+            {
+                _bannerFull = full;
+                _banner.ToolTip = new TextBlock { Text = full, TextWrapping = TextWrapping.Wrap, MaxWidth = 620 };
+            }
+        }
+
+        // One line for the banner: what this add-on actually did, never a euphemism. The full transcript
+        // is on the tooltip.
+        static string ActionLine(EnforcementRecord rec)
+        {
+            if (rec.Action == ActWarn)    return "warn only - nothing was sent to your account.";
+            if (rec.Action == ActHeld)    return "ENFORCEMENT HELD BACK - " + FirstLine(rec.Detail);
+            if (rec.Action == ActRunning) return "enforcing...";
+            if (rec.Action == ActUnknown) return "INTERRUPTED - " + FirstLine(rec.Detail);
+            return Summarise(rec.Detail);
+        }
+
+        // The transcript's own verdict lines, in order of urgency: anything the trader still has to do
+        // by hand beats the fact that the rest worked.
+        static string Summarise(string transcript)
+        {
+            if (string.IsNullOrEmpty(transcript)) return "";
+            string[] lines = transcript.Split('\n');
+            string result = "";
+            for (int i = 0; i < lines.Length; i++)
+            {
+                string s = lines[i].Trim();
+                if (s.StartsWith("ACTION NEEDED:", StringComparison.Ordinal) ||
+                    s.StartsWith("GAVE UP", StringComparison.Ordinal) ||
+                    s.StartsWith("THE ENFORCER", StringComparison.Ordinal) ||
+                    s.StartsWith("UNEXPECTED FAILURE:", StringComparison.Ordinal))
+                    return s;
+                // Last one wins: the confirmation is appended after the transcript was written.
+                if (s.StartsWith("RESULT:", StringComparison.Ordinal) || s.StartsWith("CONFIRMED", StringComparison.Ordinal))
+                    result = s;
+            }
+            return result.Length > 0 ? result : FirstLine(transcript);
+        }
+
+        static string FirstLine(string s)
+        {
+            if (string.IsNullOrEmpty(s)) return "";
+            int i = s.IndexOf('\n');
+            return i < 0 ? s : s.Substring(0, i);
+        }
+
+        // The trip time in Eastern, which is the zone every rule in this add-on is measured in. The
+        // record stores UTC, so the file is unambiguous across machines and zones.
+        string EtStamp(DateTime utc)
+        {
+            try
+            {
+                TimeZoneInfo et = EasternZone();
+                if (et != null)
+                    return TimeZoneInfo.ConvertTimeFromUtc(DateTime.SpecifyKind(utc, DateTimeKind.Utc), et)
+                           .ToString("MMM d HH:mm", CultureInfo.InvariantCulture) + " ET";
+            }
+            catch { /* fall through and say which zone it is, rather than mislabel it */ }
+            return utc.ToString("MMM d HH:mm", CultureInfo.InvariantCulture) + " UTC";
+        }
+
+        static bool NonFinite(double v) { return double.IsNaN(v) || double.IsInfinity(v); }
+
+        // "Are these numbers sound enough to close a position on?" Anything here is a no. The engine
+        // scrubs a NaN ledger row to zero and warns, so the state can read clean over a corrupt file -
+        // which is why the raw rows are checked too, not just the computed state.
+        static bool AnyNonFinite(ChallengeState st, List<TradingDay> days, double unrealized)
+        {
+            if (NonFinite(unrealized)) return true;
+            if (st != null && (NonFinite(st.Balance) || NonFinite(st.Equity) || NonFinite(st.Floor) ||
+                               NonFinite(st.RoomToFloor) || NonFinite(st.DayPnL) || NonFinite(st.BestDayPnL)))
+                return true;
+            if (days != null)
+                for (int i = 0; i < days.Count; i++)
+                    if (days[i] != null && NonFinite(days[i].RealizedPnL)) return true;
+            return false;
+        }
+
+        // A fresh latch on ANY failure, including a missing file: this is the first day of a challenge
+        // as often as it is a problem, and a latch invented out of an unreadable attribute would tell the
+        // trader he is out when he is not.
+        LatchedState LoadLatch(string path)
+        {
+            LatchedState latch = new LatchedState();
+            try
+            {
+                if (string.IsNullOrEmpty(path) || !File.Exists(path)) return latch;
+                XDocument doc = XDocument.Load(path);
+                if (doc.Root == null) return latch;
+                XElement e = doc.Root.Element("Latch");
+                if (e == null) return latch;
+
+                latch.ChallengeBreached = string.Equals((string)e.Attribute("breached"), "true", StringComparison.OrdinalIgnoreCase);
+                latch.BreachedOn       = ParseYmd((string)e.Attribute("on"));
+                latch.BreachedAt       = ParseR((string)e.Attribute("at"));
+                latch.BreachedFloor    = ParseR((string)e.Attribute("floor"));
+                latch.DailyLockoutDate = ParseYmd((string)e.Attribute("lockDate"));
+                latch.DailyLockoutAt   = ParseR((string)e.Attribute("lockAt"));
+            }
+            catch (Exception ex)
+            {
+                // Say so rather than starting clean in silence: a dropped breach latch is the panel
+                // forgetting the single most important thing it knows about this account.
+                latch = new LatchedState();
+                _storeError = "Could not read the latched state (" + path + "): " + ex.Message +
+                              " - a breach recorded earlier will not be shown until it is repaired.";
+            }
+            return latch;
+        }
+
+        // Empty rather than "0001-01-01" for MinValue, so an unset date reads as unset in the file too.
+        static string Ymd(DateTime d)
+        {
+            return d == DateTime.MinValue ? "" : d.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
+        }
+
+        static DateTime ParseYmd(string s)
+        {
+            DateTime d;
+            return DateTime.TryParseExact(s ?? "", "yyyy-MM-dd", CultureInfo.InvariantCulture, DateTimeStyles.None, out d)
+                ? DateTime.SpecifyKind(d, DateTimeKind.Unspecified)
+                : DateTime.MinValue;
+        }
+
+        static double ParseR(string s)
+        {
+            double v;
+            return double.TryParse(s ?? "", NumberStyles.Float, CultureInfo.InvariantCulture, out v) ? v : 0.0;
+        }
+
+        static EnforcementRecord ReadEnforcement(XElement e)
+        {
+            try
+            {
+                DateTime at;
+                // RoundtripKind alone, never combined with AdjustToUniversal: the combination throws at
+                // runtime, and that would take the whole ledger down on load.
+                if (!DateTime.TryParse((string)e.Attribute("at") ?? "", CultureInfo.InvariantCulture,
+                        DateTimeStyles.RoundtripKind, out at))
+                    return null;
+                DateTime date;
+                if (!DateTime.TryParseExact((string)e.Attribute("date") ?? "", "yyyy-MM-dd",
+                        CultureInfo.InvariantCulture, DateTimeStyles.None, out date))
+                    return null;
+                double v;
+                double.TryParse((string)e.Attribute("value") ?? "", NumberStyles.Float, CultureInfo.InvariantCulture, out v);
+
+                EnforcementRecord rec = new EnforcementRecord();
+                rec.AtUtc = at.Kind == DateTimeKind.Unspecified ? DateTime.SpecifyKind(at, DateTimeKind.Utc) : at.ToUniversalTime();
+                rec.TradingDate = DateTime.SpecifyKind(date, DateTimeKind.Unspecified);
+                rec.Kind     = (string)e.Attribute("kind") ?? "";
+                rec.Value    = v;
+                rec.Action   = (string)e.Attribute("action") ?? "";
+                rec.Headline = (string)e.Attribute("headline") ?? "";
+                rec.Detail   = e.Value ?? "";
+                return rec;
+            }
+            catch { return null; }   // one unreadable record is skipped; the rest of the ledger still loads
+        }
+
         // ---- interaction ----------------------------------------------------------------------------
+
+        void OnResetBreachClick(object sender, RoutedEventArgs e)
+        {
+            CockpitFrame f = _frame;
+            if (f == null) return;
+            if (FindLatch(KindBreach, f.TradingDate) == null) return;
+
+            string name = _account != null ? _account.DisplayName : "this account";
+            string question =
+                "Clear the latched breach on " + name + "?\n\n" +
+                "This clears what THIS PANEL shows and records. It does NOT undo anything your firm has " +
+                "already recorded: if they logged the breach, the account is still breached with them, and " +
+                "this button cannot give it back.\n\n" +
+                "It does not reopen a position or restart a strategy either. And if the account is still " +
+                "under its floor, the panel will latch again on the very next tick - and act again, if " +
+                "enforcement is armed for this account.";
+
+            MessageBoxResult answer;
+            try
+            {
+                Window owner = Window.GetWindow(this);
+                answer = owner != null
+                    ? MessageBox.Show(owner, question, "Funded Path - reset the latched breach", MessageBoxButton.OKCancel, MessageBoxImage.Warning)
+                    : MessageBox.Show(question, "Funded Path - reset the latched breach", MessageBoxButton.OKCancel, MessageBoxImage.Warning);
+            }
+            catch { return; }   // no dialog, no reset: this is not a decision to take on his behalf
+
+            if (answer != MessageBoxResult.OK) return;
+
+            for (int i = _enforcements.Count - 1; i >= 0; i--)
+                if (_enforcements[i] != null && _enforcements[i].Kind == KindBreach) _enforcements.RemoveAt(i);
+
+            // A fresh latch is how the engine's own contract says to reset one - there is no Clear() on
+            // LatchedState on purpose, so that clearing a live breach is always an explicit act.
+            _latched = new LatchedState();
+            PersistEnforcement(f.TradingDate);
+            NinjaTrader.Code.Output.Process("[FundedPath] the latched breach on " + name +
+                " was cleared by hand. Nothing at the firm changed.", NinjaTrader.NinjaScript.PrintTo.OutputTab1);
+            _forceRecompute = true;
+            RenderBanner(f);
+        }
 
         void SetView(bool session)
         {
@@ -1906,6 +2696,7 @@ namespace FundedPath.NT
                 _accountSelectionHandler = null;
             }
             _configure.Click -= OnConfigureClick;
+            _bannerReset.Click -= OnResetBreachClick;
             if (_paintTimer != null)
             {
                 // Stop AND null: a stopped-but-alive timer still holds its Tick delegate, which holds this

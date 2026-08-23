@@ -45,6 +45,7 @@ public class BindingStoreTests : IDisposable
         b.StartedUtc           = new DateTime(2026, 8, 22, 13, 45, 30, 123, DateTimeKind.Utc);
         b.StartBalanceOverride = 154600.5;              // a fraction, to catch a locale-formatted write
         b.PeakEodCloseSeed     = 158200.25;             // ditto, and above the override so a swap shows
+        b.Enforcement          = EnforcementMode.Armed;   // NOT the default, so a lost value shows up
         b.Notes                = "second attempt, DLL on";
 
         BindingStore saved = new BindingStore();
@@ -71,6 +72,10 @@ public class BindingStoreTests : IDisposable
         // A binding carried over from an account that had already trailed: losing this silently
         // hands the drawdown floor back the room the firm has taken away for good.
         Assert.Equal(b.PeakEodCloseSeed, got.PeakEodCloseSeed, 6);
+        // Whether this add-on may close positions and stop strategies on this account. Round-tripping
+        // it wrong in the safe direction merely disarms him; wrong in the other direction arms an
+        // account he never armed.
+        Assert.Equal(b.Enforcement, got.Enforcement);
         Assert.Equal(b.Notes, got.Notes);
     }
 
@@ -84,7 +89,7 @@ public class BindingStoreTests : IDisposable
         List<string> covered = new List<string>(new string[] {
             "AccountKey", "AccountDisplayName", "Firm", "Plan", "Size", "Phase",
             "DailyLossLimitOn", "BreachBasis", "StartedUtc", "StartBalanceOverride",
-            "PeakEodCloseSeed", "Notes"
+            "PeakEodCloseSeed", "Enforcement", "Notes"
         });
 
         PropertyInfo[] props = typeof(AccountBinding).GetProperties(BindingFlags.Public | BindingFlags.Instance);
@@ -184,14 +189,25 @@ public class BindingStoreTests : IDisposable
         File.WriteAllText(path,
             "<FundedPathBindings version=\"1\">" +
             "  <Binding><AccountKey>k</AccountKey><Phase>SomeFuturePhase</Phase>" +
-            "  <BreachBasis>Nonsense</BreachBasis></Binding>" +
+            "  <BreachBasis>Nonsense</BreachBasis><Enforcement>SuperArmed</Enforcement></Binding>" +
+            "  <Binding><AccountKey>legacy</AccountKey></Binding>" +
             "</FundedPathBindings>");
 
-        AccountBinding b = BindingStore.Load(path).Find("k");
+        BindingStore store = BindingStore.Load(path);
+        AccountBinding b = store.Find("k");
         Assert.NotNull(b);
         Assert.Equal(Phase.Evaluation, b.Phase);
         // Equity is the STRICT default: an unreadable value must warn earlier, not later (spec 1.4).
         Assert.Equal(BreachBasis.Equity, b.BreachBasis);
+
+        // The fallback that can cost money rather than accuracy. This add-on closes positions and
+        // stops strategies when it is armed, so a value it cannot read must land on WarnOnly.
+        Assert.Equal(EnforcementMode.WarnOnly, b.Enforcement);
+
+        // And the case every trader hits exactly once: a bindings.xml written before enforcement
+        // existed, carrying no such element at all. Nothing on disk may load as armed -- arming is a
+        // decision a human takes in the dialog, per account.
+        Assert.Equal(EnforcementMode.WarnOnly, store.Find("legacy").Enforcement);
     }
 
     // ---- the ledger key ----

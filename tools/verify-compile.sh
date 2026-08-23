@@ -22,20 +22,39 @@ trap 'rm -rf "$STAGE"' EXIT
 # rots the first time somebody is in a hurry, so it is a gate: any order-submission API named in
 # Engine/ or NinjaTrader/ fails the run. Line comments are stripped before matching, because these
 # files describe the APIs they refuse to call and those sentences must not trip their own gate.
-ORDER_API='Submit|OrderAction\.|CreateOrder|StartAtmStrategy|AtmStrategyCreate|\.Cancel\(|\.Change\('
+# Two tiers, because this add-on is no longer purely read-only.
+#
+# NEVER_ANYWHERE: order entry. Nothing in this repo submits, amends or cancels an order, in any file,
+# including the Enforcer. Flatten is documented to cancel the working orders as part of closing the
+# position, so there is no reason to ever reach for these.
+NEVER_ANYWHERE='Submit|OrderAction\.|CreateOrder|StartAtmStrategy|AtmStrategyCreate|\.Cancel\(|\.Change\('
+
+# ENFORCER_ONLY: the calls that mutate an account. These are the whole reason enforcement exists, and
+# they are allowed in exactly one file. The point of the split is that a reviewer never has to read
+# twelve files to know what can touch the trader's money - the gate proves it is one.
+# FlattenEverything is account-wide and undocumented: banned outright, in the Enforcer too.
+ENFORCER_ONLY='\.Flatten\(|CancelAllOrders|SetState\(State\.|IsAutoLiquidationEnabled'
+ENFORCER_FILE='NinjaTrader/Enforcer.cs'
 
 echo "Auditing for order-submission APIs..."
 HITS="$(cd "$REPO" && for f in Engine/*.cs NinjaTrader/*.cs; do
-  sed 's://.*::' "$f" | grep -nE "$ORDER_API" | sed "s|^|$f:|"
+  # Comments are stripped first: the files explain what they deliberately do NOT call, and that prose
+  # must not trip the gate that enforces it.
+  STRIPPED="$(sed 's://.*::' "$f")"
+  echo "$STRIPPED" | grep -nE "$NEVER_ANYWHERE" | sed "s|^|$f:|"
+  echo "$STRIPPED" | grep -nE 'FlattenEverything' | sed "s|^|$f: (account-wide, undocumented) |"
+  if [ "$f" != "$ENFORCER_FILE" ]; then
+    echo "$STRIPPED" | grep -nE "$ENFORCER_ONLY" | sed "s|^|$f: (only $ENFORCER_FILE may touch the account) |"
+  fi
 done)"
 
 if [ -n "$HITS" ]; then
-  echo "FAIL -- this add-on is read-only on the account, but these lines name an order API:" >&2
+  echo "FAIL -- an account-mutating call escaped NinjaTrader/Enforcer.cs, or an order API appeared:" >&2
   echo "$HITS" >&2
-  echo "If one of them is a false positive, narrow ORDER_API in this script and say why." >&2
+  echo "If one is a false positive, narrow the pattern in this script and say why in the same commit." >&2
   exit 1
 fi
-echo "PASS -- no order-submission API in Engine/ or NinjaTrader/."
+echo "PASS -- no order entry anywhere, and every account-mutating call is inside $ENFORCER_FILE."
 echo
 
 # ---- gate 2: it compiles inside the real Custom tree -----------------------------------------

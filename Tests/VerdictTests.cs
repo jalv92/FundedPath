@@ -1,3 +1,4 @@
+using System.Collections.Generic;
 using FundedPath.Engine;
 using Xunit;
 
@@ -129,6 +130,58 @@ public class VerdictTests
         ChallengeState alive = ChallengeEngine.Evaluate(r, Fixtures.NoDays(), -1300, 0, BreachBasis.Equity);
         Assert.Equal(Verdict.DailyLockout, alive.Verdict);
         Assert.Equal("Daily loss limit - reached, $100 past it", alive.BindingConstraint);
+    }
+
+    [Fact]
+    public void The_daily_limit_is_decided_at_the_open_and_cannot_re_arm_mid_session()
+    {
+        // The regression this exists for: the gate that decides WHETHER a daily limit applies used to
+        // read the LIVE balance, while the level it draws reads the day's OPENING balance. On a funded
+        // account that opened above the Initial Trail Balance the two disagreed within one session:
+        //
+        //   day P&L | live balance | verdict      | what the panel said
+        //        0  |      52,500  | InProgress   | "nothing is watching your daily loss today"
+        //     -401  |      52,099  | InProgress   | a dashed red line appears out of nowhere
+        //   -1,200  |      51,300  | DailyLockout | *** an armed enforcer flattens the account ***
+        //
+        // The session opened declaring the rule unwatched and then enforced it. Both must read the
+        // OPENING balance, so a daily limit is settled once, at the open, like the firm settles it.
+        AccountBinding b = new AccountBinding();
+        b.AccountKey = BindingStore.KeyFor("Playback", "Sim101");
+        b.Firm  = Firm.Lucid;
+        b.Plan  = "LucidPro";
+        b.Size  = 50000;
+        b.Phase = Phase.LiveSim;
+        b.DailyLossLimitOn = true;
+        PropRules r = b.ResolveRules();
+
+        // Yesterday closed at 52,500 - ABOVE the 52,100 trail, so LucidScale has taken over and this
+        // engine watches nothing today, whatever today's loss does to the live balance.
+        IReadOnlyList<TradingDay> openedAbove = Fixtures.DaysFromPnL(2500);
+
+        ChallengeState flat = ChallengeEngine.Evaluate(r, openedAbove, 0, 0, BreachBasis.Equity);
+        Assert.Equal(52500.0, flat.Balance, 6);
+        Assert.Equal(0.0, flat.DailyLossLimitLevel, 6);
+
+        // Down 401: the live balance is now under the trail. The rule must stay disarmed and the line
+        // must stay off the chart.
+        ChallengeState dipped = ChallengeEngine.Evaluate(r, openedAbove, -401, 0, BreachBasis.Equity);
+        Assert.Equal(0.0, dipped.DailyLossLimitLevel, 6);
+        Assert.NotEqual(Verdict.DailyLockout, dipped.Verdict);
+
+        // Down the full 1,200 - the amount that used to trip it. Still disarmed, still no lockout,
+        // and therefore nothing for an armed enforcer to act on.
+        ChallengeState down = ChallengeEngine.Evaluate(r, openedAbove, -1200, 0, BreachBasis.Equity);
+        Assert.Equal(0.0, down.DailyLossLimitLevel, 6);
+        Assert.NotEqual(Verdict.DailyLockout, down.Verdict);
+
+        // Control: the same rule set on a day that OPENED below the trail is armed all session, and
+        // the level is the opening balance minus the limit - proving the assertions above measure the
+        // gate and not a limit that is simply switched off.
+        IReadOnlyList<TradingDay> openedBelow = Fixtures.DaysFromPnL(1000);   // closed 51,000
+        ChallengeState armed = ChallengeEngine.Evaluate(r, openedBelow, -1200, 0, BreachBasis.Equity);
+        Assert.Equal(49800.0, armed.DailyLossLimitLevel, 6);
+        Assert.Equal(Verdict.DailyLockout, armed.Verdict);
     }
 
     [Fact]

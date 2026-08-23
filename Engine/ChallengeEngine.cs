@@ -25,12 +25,19 @@ namespace FundedPath.Engine
 
         // days must be ordered oldest-first and carry RealizedPnL; ClosingBalance and FloorInForce
         // are filled in by this call.
+        //
+        // latched and today are the memory this function cannot hold itself. Both default so every
+        // existing caller keeps working: with no latch, a breach and a lockout are reported exactly
+        // as they were before -- live, for as long as the condition holds. Latching only ever ADDS a
+        // verdict, it can never take one away.
         public static ChallengeState Evaluate(
             PropRules rules,
             IReadOnlyList<TradingDay> days,   // completed days only, oldest first
             double openDayRealized,           // realized P&L of the day in progress
             double openUnrealized,            // unrealized P&L of open positions
-            BreachBasis breachBasis)
+            BreachBasis breachBasis,
+            LatchedState latched = null,      // caller-owned and persisted; never mutated here
+            DateTime today = default(DateTime))  // ET trading date of the day in progress; MinValue = unknown
         {
             List<string> warnings = new List<string>();
 
@@ -40,14 +47,14 @@ namespace FundedPath.Engine
             if (rules == null)
             {
                 warnings.Add("No challenge is bound to this account. Nothing is being measured.");
-                return UntrackedState(warnings);
+                return UntrackedState(warnings, latched);
             }
 
             if (!rules.Modelled)
             {
                 warnings.Add((string.IsNullOrEmpty(rules.Plan) ? rules.Firm.ToString() : rules.Plan)
                              + " is not modelled yet. Nothing is being measured.");
-                return UntrackedState(warnings);
+                return UntrackedState(warnings, latched);
             }
 
             // Account.Get on an account mid-connect can hand back garbage. A NaN would poison every
@@ -196,7 +203,6 @@ namespace FundedPath.Engine
             // numbers the trader reads side by side can never disagree.
             double breachValue = breachBasis == BreachBasis.Equity ? equityNow : balanceNow;
             double roomToFloor = breachValue - liveFloor;
-            bool breached = breachValue <= liveFloor;
 
             if (breachBasis == BreachBasis.Equity)
                 warnings.Add("Open positions are counted against the floor. Lucid says \"balance\" and never says \"unrealized\", so this is the strict reading: it warns you earlier than the firm might.");
@@ -211,7 +217,17 @@ namespace FundedPath.Engine
             // bigger allowance than the fixed one - and this engine does not enforce that. Keeping
             // the fixed limit armed up there reports a lockout on a session the firm would still
             // let the trader trade. See docs/rules-sources.md section 2.
-            bool scaleReplacesFixedDll = rules.ScaleDllPctOfPeakProfit > 0 && balanceNow >= rules.TrailStopClose;
+            //
+            // Gated on `balance` -- the day's OPENING balance -- not on `balanceNow`, and this is the one
+            // line in the file that spends money if it is wrong. Whether a daily limit applies is decided
+            // ONCE, at the open, exactly like the level below it. Reading the live balance let the rule
+            // re-arm mid-session: a LiveSim account that opened at 52,500 (above the trail, limit
+            // disarmed, panel saying "nothing is watching your daily loss today") crossed back under
+            // 52,100 at -$401 of intraday loss, a dashed red line materialised out of nowhere, and at
+            // -$1,200 an armed enforcer would have flattened the account on a rule the same session had
+            // declared unwatched. `balance` and the level must be the same quantity or the panel
+            // contradicts itself within a session.
+            bool scaleReplacesFixedDll = rules.ScaleDllPctOfPeakProfit > 0 && balance >= rules.TrailStopClose;
             bool dllOn = rules.HasDailyLossLimit && !scaleReplacesFixedDll;
             if (rules.HasDailyLossLimit && scaleReplacesFixedDll)
                 warnings.Add("Your balance is at or above " + Money(rules.TrailStopClose)
@@ -219,7 +235,68 @@ namespace FundedPath.Engine
             // DailyLossLimit is a positive magnitude. Room is measured from the day's opening balance, so
             // being up on the day genuinely buys that much extra room before the limit bites.
             double dllRoom = dllOn ? rules.DailyLossLimit + dayPnL : 0.0;
-            bool dailyLockout = dllOn && dayPnL <= -rules.DailyLossLimit + Cent;
+
+            // The balance at or below which today breaks the daily limit. The day's OPENING balance is
+            // the PREVIOUS day's close -- `balance` here, before the day in progress is added -- never
+            // today's first fill. 0 when the limit is off, absent or disarmed.
+            double dllLevel = dllOn ? balance - rules.DailyLossLimit : 0.0;
+
+            // ---- latching: you touched it, the day is over -------------------------------------------
+            //
+            // Everything above is a function of the CURRENT state, which is why a breach used to live for
+            // one tick: the moment the day's loss recovered above the limit, or equity recovered above the
+            // floor, the verdict reverted to ON TRACK. No firm works that way. The latch is the memory,
+            // and the CALLER owns and persists it -- this function may not mutate what it was handed, so
+            // it works on a copy and returns it on the state.
+            LatchedState latch = latched == null ? new LatchedState() : latched.Copy();
+
+            // The ET trading date of the day in progress, passed in rather than read: the clock belongs to
+            // the ACCOUNT (a Playback account ages against the replay, spec section 5) and this function
+            // holds none. .Date because the latch compares day identities, not instants.
+            DateTime openDate = today.Date;
+
+            // Terminal. It survives any recovery and clears ONLY when the trader resets the challenge,
+            // i.e. hands back a fresh LatchedState.
+            bool breachedNow = breachValue <= liveFloor;
+            if (breachedNow && !latch.ChallengeBreached)
+            {
+                latch.ChallengeBreached = true;
+                latch.BreachedOn = openDate;        // MinValue when no date was supplied; the wording omits it
+                latch.BreachedAt = breachValue;
+                latch.BreachedFloor = liveFloor;    // both halves: the floor RATCHETS, so "$340 below the
+                                                    // floor at the time" cannot be rebuilt after the fact
+            }
+            bool breached = breachedNow || latch.ChallengeBreached;
+
+            // Latched for the TRADING DAY and nothing more -- a soft limit locks the day, never the
+            // account. It clears when the trading date CHANGES (a Playback rewind moves it backwards, and
+            // that is a different day too), never when the P&L improves.
+            bool dllHitNow = dllOn && dayPnL <= -rules.DailyLossLimit + Cent;
+            if (latch.DailyLockoutDate != DateTime.MinValue
+                && openDate != DateTime.MinValue
+                && openDate != latch.DailyLockoutDate)
+            {
+                latch.DailyLockoutDate = DateTime.MinValue;
+                latch.DailyLockoutAt = 0.0;
+            }
+            if (dllHitNow && openDate != DateTime.MinValue && latch.DailyLockoutDate == DateTime.MinValue)
+            {
+                latch.DailyLockoutDate = openDate;
+                latch.DailyLockoutAt = dayPnL;      // what the day stood at when it bit
+            }
+
+            // The live hit is ORed in, never replaced by the latch. Two consequences, both deliberate:
+            // a caller that passes no date still gets the lockout it always got, and latching can only
+            // ever ADD a verdict, never take one away. Holding it reads HasDailyLossLimit rather than the
+            // armed gate, so crossing the Initial Trail Balance mid-session cannot unlock a day that has
+            // already bitten, while switching the rule off in the dialog does clear it.
+            bool dailyLockout = dllHitNow
+                                || (rules.HasDailyLossLimit && latch.DailyLockoutDate != DateTime.MinValue);
+
+            // Fail loud instead of silently not latching: a caller that persists a latch but forgets the
+            // trading date gets the flash-and-vanish lockout back, which is the bug the latch exists to kill.
+            if (latched != null && dllOn && openDate == DateTime.MinValue)
+                warnings.Add("The trading date was not supplied to the engine, so a daily lockout cannot be held for the rest of the session. That is a wiring bug in the add-on, not a rule.");
 
             // ---- consistency -----------------------------------------------------------------------
             double totalProfit = balanceNow - start;
@@ -307,6 +384,10 @@ namespace FundedPath.Engine
             // on an account that is already dead.
             if (breached) pick = PickFloor;
 
+            // A locked day is what binds today even after the loss has recovered: the trader cannot trade
+            // again until the session rolls, whatever the live room now says.
+            if (dailyLockout && !breached) pick = PickDll;
+
             // A days requirement has no dollar slack, so it can never win the comparison above. It becomes
             // the binding constraint exactly when the money side is already done: the target is met, the
             // consistency rule is satisfied, nothing has bitten, and the only thing left between the
@@ -330,9 +411,18 @@ namespace FundedPath.Engine
                     binding = goalName + " - " + Money(toTarget) + " to go";
                     break;
                 case PickDll:
-                    binding = dllRoom >= 0
-                        ? "Daily loss limit - " + Money(dllRoom) + " of room today"
-                        : "Daily loss limit - reached, " + Money(-dllRoom) + " past it";
+                    if (dailyLockout && !dllHitNow)
+                        // The LATCH alone is holding the day: he has traded back above the limit, or it
+                        // disarmed under him at the Initial Trail Balance. Either way the live room is not
+                        // a number worth printing here -- quoting him room on a locked day reads as
+                        // permission to use it, and on the disarmed path it is $0 of a rule nobody is
+                        // enforcing. What he needs is the day it bit and at what.
+                        binding = "Daily loss limit - hit today at " + Money(-latch.DailyLockoutAt)
+                                  + " down. The day is locked; trading back above it does not reopen it.";
+                    else if (dllRoom >= 0)
+                        binding = "Daily loss limit - " + Money(dllRoom) + " of room today";
+                    else
+                        binding = "Daily loss limit - reached, " + Money(-dllRoom) + " past it";
                     break;
                 case PickConsistency:
                     binding = consistencySlack >= 0
@@ -344,9 +434,16 @@ namespace FundedPath.Engine
                               + (daysShort == 1 ? " more day needed" : " more days needed");
                     break;
                 default:
-                    binding = roomToFloor >= 0
-                        ? "Floor - " + Money(roomToFloor) + " of room"
-                        : "Floor - " + Money(-roomToFloor) + " below it";
+                    if (breached && roomToFloor > Cent)
+                        // A latched breach that has since recovered. "$210 of room" on its own is the
+                        // sentence that made this cockpit lie, so the breach is named first and the room
+                        // second, with what it is worth said out loud.
+                        binding = "Floor - breached" + OnDay(latch.BreachedOn) + " at " + Money(latch.BreachedAt)
+                                  + ". The " + Money(roomToFloor) + " of room now does not bring it back.";
+                    else if (roomToFloor >= 0)
+                        binding = "Floor - " + Money(roomToFloor) + " of room";
+                    else
+                        binding = "Floor - " + Money(-roomToFloor) + " below it";
                     break;
             }
 
@@ -355,7 +452,16 @@ namespace FundedPath.Engine
             switch (verdict)
             {
                 case Verdict.Breached:
-                    headline = "BREACHED" + Dot + Money(Math.Max(0.0, -roomToFloor)) + " BELOW THE FLOOR";
+                    // Still under the floor: the live number says it all. Latched but recovered: say WHEN
+                    // it happened, how deep it was AT THE TIME, and where the account stands now -- the
+                    // trader reads this line after the fact, and a bare state would send him looking for
+                    // the day it broke.
+                    headline = roomToFloor > Cent
+                        ? "BREACHED" + OnDay(latch.BreachedOn) + Dot
+                          + Money(Math.Max(0.0, latch.BreachedFloor - latch.BreachedAt))
+                          + " below the floor at the time. Now " + Money(roomToFloor)
+                          + " above it, which does not matter."
+                        : "BREACHED" + Dot + Money(Math.Max(0.0, -roomToFloor)) + " BELOW THE FLOOR";
                     break;
                 case Verdict.DailyLockout:
                     headline = "DAILY LOCKOUT" + Dot + "DONE FOR TODAY";
@@ -408,6 +514,9 @@ namespace FundedPath.Engine
             state.QualifyingDays = qualifying;
             state.Days = series;
             state.Warnings = warnings.ToArray();
+            state.Latched = latch;
+            state.DayOpenBalance = balance;
+            state.DailyLossLimitLevel = dllLevel;
             return state;
         }
 
@@ -457,10 +566,13 @@ namespace FundedPath.Engine
 
         // An account measured by nothing. Every collection is non-null so the window can bind to it
         // directly, and ConsistencyOk is true so an untracked account does not paint a red chip.
-        private static ChallengeState UntrackedState(List<string> warnings)
+        private static ChallengeState UntrackedState(List<string> warnings, LatchedState latched)
         {
             ChallengeState s = new ChallengeState();
             s.Verdict = Verdict.Untracked;
+            // Passed straight through, untouched: an unbound account measures nothing, so it must not
+            // latch anything -- and it must not silently DROP a latch the caller is persisting either.
+            s.Latched = latched == null ? new LatchedState() : latched.Copy();
             s.Headline = "UNTRACKED" + Dot + "NO CHALLENGE BOUND";
             s.BindingConstraint = "Nothing is being measured on this account.";
             s.ConsistencyOk = true;
@@ -487,6 +599,14 @@ namespace FundedPath.Engine
         private static string Money(double v)
         {
             return "$" + v.ToString("N0", CultureInfo.InvariantCulture);
+        }
+
+        // "Aug 19", or nothing at all when the caller gave no trading date. InvariantCulture for the
+        // same reason Money() uses it: NinjaTrader runs under the machine locale and a Spanish install
+        // would print "ago 19" into an English sentence.
+        private static string OnDay(DateTime d)
+        {
+            return d == DateTime.MinValue ? "" : " " + d.ToString("MMM d", CultureInfo.InvariantCulture);
         }
 
         private static string Pct(double v)

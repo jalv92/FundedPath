@@ -19,8 +19,54 @@ namespace FundedPath.NT
             if (State == State.SetDefaults)
             {
                 Name        = "FundedPath";
-                Description = "Prop-firm challenge cockpit: floor, headroom and what breaks first. Read-only on the account.";
+                Description = "Prop-firm challenge cockpit: floor, headroom and what breaks first. Enforcement is off unless you arm it per account.";
             }
+            else if (State == State.Terminated)
+            {
+                // THE RECOMPILE TRAP. F5 builds a new NinjaTrader.Custom and loads it beside the old
+                // one; NT8 raises Terminated on THIS (old) add-on instance, but nothing closes the
+                // windows the old assembly created. They keep running old code on their own
+                // dispatcher threads, so the trader reads yesterday's strings off today's build --
+                // an hour lost to a "missing" feature that had already shipped.
+                //
+                // Statics are per-assembly, so FundedPathWindow.Snapshot() here returns exactly the
+                // windows of THIS generation. After a recompile he is left with a fresh window or no
+                // window, never a stale one.
+                CloseOurWindows();
+            }
+        }
+
+        static void CloseOurWindows()
+        {
+            Window[] doomed = FundedPathWindow.Snapshot();
+            if (doomed.Length == 0)
+                return;
+
+            for (int i = 0; i < doomed.Length; i++)
+            {
+                Window w = doomed[i];
+                try
+                {
+                    // Each cockpit window lives on one of NT8's spare dispatcher threads, not on the
+                    // Control Center's, so Close() from here is a cross-thread call and throws.
+                    // InvokeAsync because a synchronous Invoke onto a window whose thread is busy
+                    // would block NinjaTrader's own shutdown/compile path.
+                    w.Dispatcher.InvokeAsync(new System.Action(delegate
+                    {
+                        // Already gone, already closing, or torn down by the workspace: all of them
+                        // are fine and none of them is an error worth a line in the log.
+                        try { w.Close(); } catch { }
+                    }));
+                }
+                catch { }
+            }
+
+            // One line, deliberately: it is also the only evidence that NT8 really does deliver
+            // Terminated to the outgoing add-on on a recompile. If a recompile ever leaves a stale
+            // window AND this line is missing from the Output tab, the assumption is what broke.
+            NinjaTrader.Code.Output.Process(
+                "[FundedPath] add-on terminated (recompile or shutdown) - closing " + doomed.Length + " open window(s).",
+                NinjaTrader.NinjaScript.PrintTo.OutputTab1);
         }
 
         // Called on the thread of each new NTWindow, including after a recompile - so this runs again
