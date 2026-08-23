@@ -395,11 +395,15 @@ namespace FundedPath.NT
             _dailyY  = _plotB - (_dailyLimit - vBot) / vSpan * ph;
 
             _balLine   = BuildSpline(balPts,   false, 0);
-            _floorLine = BuildSpline(floorPts, false, 0);
+            // The floor is a STEP, not a curve - see BuildStep. It used to run through BuildSpline for
+            // visual consistency with the balance, and on a real two-point challenge that turned a
+            // single overnight ratchet into a diagonal creeping across the whole plot: it read as the
+            // drawdown drifting up all day, on a day with no trades at all.
+            _floorLine = BuildStep(floorPts, false, 0);
             // No wash under a single point: the fill would be a 6px-wide sliver dropping to the plot
             // floor - a rendering artefact, not a gradient. Day one draws its two marks and nothing else.
             _balFill   = n > 1 ? BuildSpline(balPts,   true, _plotB) : null;
-            _floorFill = n > 1 ? BuildSpline(floorPts, true, _plotB) : null;
+            _floorFill = n > 1 ? BuildStep(floorPts, true, _plotB) : null;
 
             // --- gutter ticks that survive: inside the plot band, and not sitting on the target label.
             var keepFt = new List<FormattedText>();
@@ -462,6 +466,59 @@ namespace FundedPath.NT
         // under the red floor when it never did. The mockup's rounded peaks ARE that overshoot, so it
         // stays. If it ever misleads, clamp c1.Y/c2.Y into [min(p1.Y,p2.Y), max(p1.Y,p2.Y)] - two lines,
         // and the cubic's convex hull then guarantees the drawn curve never leaves the data's range.
+        // The drawdown floor, drawn as what it is: a step function.
+        //
+        // An end-of-day trailing floor moves ONCE, at the session close, and holds flat for the whole
+        // day. Interpolating between two days therefore draws a rule that does not exist. It was smoothed
+        // to begin with, to match the balance curve, and the first real two-day challenge showed why that
+        // was wrong: one overnight ratchet of $431.50 rendered as a gentle diagonal from Aug 18 to Aug 20,
+        // which reads as the floor climbing continuously through a day on which nothing was traded. The
+        // trader read it as a bug. It was the drawing, not the number.
+        //
+        // Held flat to the next day's x, then a vertical jump: the horizontal run is the day you trade
+        // against that level, and the riser is the close that moved it. The shape teaches the rule.
+        private static Geometry BuildStep(Point[] p, bool closeToBaseline, double baselineY)
+        {
+            var geo = new StreamGeometry();
+            if (p == null || p.Length == 0) { geo.Freeze(); return geo; }
+
+            // Same single-point stub as BuildSpline, and for the same reason: a zero-length figure lays
+            // no dash and draws nothing, so day one would show no floor at all.
+            bool solo = p.Length == 1;
+            Point head = solo ? new Point(p[0].X - SoloHalf, p[0].Y) : p[0];
+            Point tail = solo ? new Point(p[0].X + SoloHalf, p[0].Y) : p[p.Length - 1];
+
+            using (StreamGeometryContext ctx = geo.Open())
+            {
+                ctx.BeginFigure(head, closeToBaseline, false);
+
+                if (solo)
+                {
+                    ctx.LineTo(tail, true, false);
+                }
+                else
+                {
+                    for (int i = 1; i < p.Length; i++)
+                    {
+                        // Hold the level the trader actually traded against all of day i-1...
+                        ctx.LineTo(new Point(p[i].X, p[i - 1].Y), true, false);
+                        // ...then the ratchet at the close. A day that did not raise the floor emits a
+                        // zero-length riser, which is exactly right: nothing moved.
+                        ctx.LineTo(p[i], true, false);
+                    }
+                }
+
+                if (closeToBaseline)
+                {
+                    ctx.LineTo(new Point(tail.X, baselineY), false, false);
+                    ctx.LineTo(new Point(head.X, baselineY), false, false);
+                }
+            }
+
+            geo.Freeze();
+            return geo;
+        }
+
         private static Geometry BuildSpline(Point[] p, bool closeToBaseline, double baselineY)
         {
             var geo = new StreamGeometry();
