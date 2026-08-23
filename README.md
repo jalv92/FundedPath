@@ -229,6 +229,19 @@ and warns instead whenever this panel is running on data it cannot vouch for: a 
 failed to load, a missing Eastern time zone, an account in another currency, a non-finite number in
 the day ledger. A tool that flattens on bad data is worse than one that does nothing.
 
+<p align="center">
+  <img src="docs/images/funded-path-enforcement.png" alt="The Funded Path window on a Playback account after a rule break: a red banner reads BREACHED - $265.50 below the floor - Aug 22 20:58 ET - CONFIRMED at Aug 22 20:58 ET: no open position and no working order remain. The session curve climbs to $52,000, rolls over and ends inside the shaded red band under the floor, and the right rail reads To target $4,874 at 0% done, Room to floor -$305.50 against a floor of $48,431.50 on an equity basis, Account equity $48,126 at -$2,305.50 for the session, Floor status Trailing, and 14 trades today" width="960">
+</p>
+
+<p align="center"><em>The same window a moment after a break, on a replay account. What the banner reports is not
+<em>&ldquo;a flatten was sent&rdquo;</em> — it is <strong>&ldquo;CONFIRMED &hellip; no open position and no working order
+remain&rdquo;</strong>, read back from the account after the fact. Sending an instruction and having none of your
+risk left are different claims, and only the second one is worth putting on a banner. The verdict is
+<strong>latched</strong>: the curve is drawn against the floor it broke and stays broken there, because the firm
+does not un-fail you when price comes back. The button in this capture says <code>RESET BREACH</code>; it is
+now <code>START A NEW RUN</code>, and it does more than clear the latch — it moves the run's first counted day to
+today, so the days already recorded stop counting, while nothing is deleted from the ledger on disk.</em></p>
+
 **Every call that touches an account lives in one file**, `NinjaTrader/Enforcer.cs`, and
 `tools/verify-compile.sh` proves it rather than asking you to trust it. Two tiers: order entry
 (`Submit`, `OrderAction.`, `CreateOrder`, `StartAtmStrategy`, `AtmStrategyCreate`, `.Cancel(`,
