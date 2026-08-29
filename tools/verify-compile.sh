@@ -78,18 +78,67 @@ OURS="$(cd "$REPO" && ls Engine/*.cs NinjaTrader/*.cs | xargs -n1 basename | pas
 echo "Building the full tree; keeping only errors that name: $OURS"
 echo
 
-OUT="$STAGE/build.log"
-nt8c build --custom-dir "$STAGE/Custom" --no-emit >"$OUT" 2>&1
+# The verdict must NOT rest on grepping a log. This gate used to decide purely by whether any
+# `: error ` line named one of our basenames, with nt8c's exit code thrown away -- so every way
+# nt8c can fail WITHOUT producing such a line printed PASS. Reproduced: `nt8c build --custom-dir
+# <missing>` exits 3 printing only `error: custom dir not found: ...`, and an empty tree exits 3
+# printing `error: no .cs files found under ...`. Neither names our files, so both were a green
+# run over a build that never happened.
+#
+# So: capture the exit code, ask for structured output, and refuse a vacuous pass.
+OUT="$STAGE/build.json"
+nt8c build --custom-dir "$STAGE/Custom" --no-emit --agent >"$OUT" 2>&1
+RC=$?
+OURS_COUNT="$(cd "$REPO" && ls Engine/*.cs NinjaTrader/*.cs | wc -l)"
 
-# TextPosition CS1503 is a known nt8c false positive (Vendor.dll vs Custom.dll enum identity) that
-# the real Editor compiles fine; it is filtered out here so it cannot mask a real failure.
-MINE="$(grep -E "($OURS)" "$OUT" | grep -E ': error ' | grep -v 'CS1503.*TextPosition' || true)"
+python3 - "$OUT" "$RC" "$OURS" "$OURS_COUNT" <<'PY'
+import json, re, sys
+raw = open(sys.argv[1]).read()
+rc, ours, ours_count = int(sys.argv[2]), sys.argv[3], int(sys.argv[4])
 
-if [ -n "$MINE" ]; then
-  echo "FAIL -- errors in our files:"
-  echo "$MINE"
-  exit 1
-fi
+try:
+    d = json.loads(raw)
+except Exception:
+    # A hard nt8c failure prints a bare `error: ...` line instead of JSON. Reading that as
+    # "no errors named our files" is exactly the old bug.
+    print(raw.strip()[:2000])
+    print("FAIL -- nt8c did not produce JSON (exit %d). The build did not run." % rc)
+    sys.exit(1)
 
-echo "PASS -- no errors in Funded Path files."
-grep -cE ': error ' "$OUT" | sed 's/^/(stock-tree errors ignored: /; s/$/)/'
+errs = d.get("results", {}).get("errors", []) or []
+n = d.get("meta", {}).get("files_compiled", 0) or 0
+
+# A build that compiled fewer files than we staged did not compile the tree, whatever it says
+# about errors. This floor is what makes a green mean something.
+if n < ours_count:
+    print("FAIL -- nt8c compiled %s files, fewer than the %d Funded Path sources staged. "
+          "The build did not reach our code." % (n, ours_count))
+    sys.exit(1)
+
+pat = re.compile("(" + ours + ")")
+mine = [e for e in errs if pat.search(e.get("file", "") or "")]
+
+# TextPosition CS1503 is a known nt8c false positive (Vendor.dll vs Custom.dll enum identity)
+# that the real Editor compiles fine. Suppressed, but COUNTED and printed: silently swallowing
+# a whole error code is how a genuine CS1503 on a TextPosition argument would slip through.
+def is_known_fp(e):
+    return e.get("code") == "CS1503" and "TextPosition" in (e.get("message", "") or "")
+
+fp = [e for e in mine if is_known_fp(e)]
+mine = [e for e in mine if not is_known_fp(e)]
+
+print("files compiled: %s   errors in tree: %d   in Funded Path files: %d"
+      % (n, len(errs), len(mine)))
+if fp:
+    print("(suppressed %d known nt8c TextPosition CS1503 false positive(s) in our files)" % len(fp))
+
+if mine:
+    print("FAIL -- errors in our files:")
+    for e in mine[:40]:
+        print("  %s(%s,%s): %s %s" % (e.get("file", "?").split("/")[-1], e.get("line"),
+                                      e.get("col"), e.get("code"), e.get("message")))
+    sys.exit(1)
+
+print("PASS -- no errors in Funded Path files.")
+print("(stock-tree errors ignored: %d)" % (len(errs) - len(mine) - len(fp)))
+PY
